@@ -84,8 +84,7 @@ func (s *Session) Ensure() error {
 func (s *Session) launch() error {
 	l := launcher.New().
 		UserDataDir(s.cfg.ProfileDir).
-		Headless(s.cfg.Headless).
-		NoSandbox(true)
+		Headless(s.cfg.Headless)
 	if s.cfg.ChromeBin != "" {
 		l.Bin(s.cfg.ChromeBin)
 	}
