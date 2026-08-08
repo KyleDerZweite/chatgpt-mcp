@@ -1,0 +1,8 @@
+chatgpt-mcp
+*.exe
+*.test
+/dist/
+.DS_Store
+
+# error screenshots can contain account data
+debug/
