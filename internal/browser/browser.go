@@ -84,7 +84,9 @@ func (s *Session) Ensure() error {
 func (s *Session) launch() error {
 	l := launcher.New().
 		UserDataDir(s.cfg.ProfileDir).
-		Headless(s.cfg.Headless)
+		Headless(s.cfg.Headless).
+		Set("disable-blink-features", "AutomationControlled").
+		Delete("enable-automation")
 	if s.cfg.ChromeBin != "" {
 		l.Bin(s.cfg.ChromeBin)
 	}
