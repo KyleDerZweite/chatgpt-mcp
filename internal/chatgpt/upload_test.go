@@ -80,8 +80,19 @@ func TestUploadAllowsCanonicalFileWithinRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validateUploadPaths: %v", err)
 	}
-	if len(got) != 1 || got[0] != path {
-		t.Fatalf("validated paths = %v, want [%s]", got, path)
+	if len(got) != 1 || !filepath.IsAbs(got[0]) {
+		t.Fatalf("validated paths = %v, want one absolute path", got)
+	}
+	wantInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat requested upload: %v", err)
+	}
+	gotInfo, err := os.Stat(got[0])
+	if err != nil {
+		t.Fatalf("stat validated upload: %v", err)
+	}
+	if !os.SameFile(wantInfo, gotInfo) {
+		t.Fatalf("validated path %q does not identify requested file %q", got[0], path)
 	}
 }
 
