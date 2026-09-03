@@ -245,6 +245,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, completionErr := s.backend.Complete(requestCtx, prompt, browserModel(req.Model), s.timeout)
+	if completionErr == nil {
+		completionErr = requestCtx.Err()
+	}
 	if completionErr != nil {
 		s.logError(completionID, req.Model, completionErr)
 		s.writeError(w, backendStatus(requestCtx, completionErr), completionErr.Error(), "api_error", "browser_error")
@@ -254,6 +257,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logError(completionID, req.Model, err)
 		s.writeError(w, backendStatus(requestCtx, err), err.Error(), "api_error", "browser_error")
+		return
+	}
+	if completionErr = requestCtx.Err(); completionErr != nil {
+		s.logError(completionID, req.Model, completionErr)
+		s.writeError(w, backendStatus(requestCtx, completionErr), completionErr.Error(), "api_error", "browser_error")
 		return
 	}
 	s.writeCompletion(w, completionID, created, req.Model, output, calls, estimateUsage(prompt, result.Response))
@@ -393,7 +401,11 @@ func (s *Server) resultOutput(result *chatgpt.AskResult, allowed map[string]tool
 			return "", nil, formatErr
 		}
 		if format == nil || format.Type == "text" {
-			content = protocolResponse
+			if result.ResponseFormatted {
+				content = result.Response
+			} else {
+				content = protocolResponse
+			}
 		} else {
 			content, err = normalizeResponseContent(content, req.ResponseFormat)
 			if err != nil {

@@ -65,6 +65,8 @@ func TestDOMFixtures(t *testing.T) {
 ===</p>
 				<div role="status">SECRET NESTED STATUS</div>
 		<ul><li hidden>SECRET HIDDEN LIST</li><li>First</li><li>Second</li></ul>
+		<ul><li>Parent<ul><li>Child<ol start="10"><li>Grandchild</li></ol></li></ul></li></ul>
+		<ol start="10"><li>Ten<ul><li>Nested under ten</li></ul></li></ol>
 				<ol start="3"><li>Third</li><li value="7">Seventh</li><li>Eighth</li></ol>
 		<div id="hidden-opacity" style="opacity:0"><p>SECRET ZERO OPACITY</p></div>
 		<div style="visibility:collapse"><p>SECRET COLLAPSED VISIBILITY</p></div>
@@ -119,6 +121,9 @@ return</code></pre>
 		if err != nil {
 			t.Fatalf("extract response: %v", err)
 		}
+		if !answer.HasSemanticMarkdown {
+			t.Fatal("structured response was not identified as semantic Markdown")
+		}
 		text := answer.response()
 		for _, want := range []string{
 			"## Result",
@@ -131,6 +136,8 @@ return</code></pre>
 			"\\---",
 			"Title\n\\===",
 			"- First",
+			"- Parent\n  - Child\n    10. Grandchild",
+			"10. Ten\n    - Nested under ten",
 			"3. Third\n7. Seventh\n8. Eighth",
 			"```go\nfmt.Println(\"thinking and reasoning\")\n\nreturn\n```",
 			"| Name | Value |",
@@ -409,6 +416,64 @@ return</code></pre>
 		}()
 		if _, err := resolveComposerOnce(page, ctx, false); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Fatalf("ambiguous composer error = %v", err)
+		}
+	})
+
+	t.Run("image-only assistant content completes as formatted Markdown", func(t *testing.T) {
+		fixture := `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1">
+  <div data-message-author-role="assistant" data-message-id="assistant-image" data-is-streaming="false">
+    <div data-message-content><img src="https://example.com/generated.png" alt="Generated" width="32" height="32"></div>
+  </div>
+</div>
+<form><input id="prompt-textarea"><button data-testid="send-button">Send</button></form>
+</main></body></html>`
+		if err := page.Context(ctx).SetDocumentContent(fixture); err != nil {
+			t.Fatalf("set image-only fixture DOM: %v", err)
+		}
+		state, err := client.evaluateSnapshotScript(ctx, snapshotStateJS)
+		if err != nil {
+			t.Fatalf("snapshot image-only state: %v", err)
+		}
+		if !state.HasResponseContent || !state.TerminalSignal || state.IsGenerating {
+			t.Fatalf("image-only response did not expose completed content: %+v", state)
+		}
+		answer, err := client.evaluateSnapshotScript(ctx, snapshotJS)
+		if err != nil {
+			t.Fatalf("extract image-only response: %v", err)
+		}
+		if got, want := answer.response(), "![Generated](https://example.com/generated.png)"; got != want {
+			t.Fatalf("image-only response = %q, want %q", got, want)
+		}
+		if !answer.HasSemanticMarkdown {
+			t.Fatal("image-only response was not identified as semantic Markdown")
+		}
+	})
+
+	t.Run("plain text is not marked as semantic Markdown", func(t *testing.T) {
+		fixture := `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1">
+  <div data-message-author-role="assistant" data-message-id="assistant-plain" data-is-streaming="false">
+    <div data-message-content><p>Literal *asterisks* remain text.</p></div>
+  </div>
+</div>
+<form><input id="prompt-textarea"><button data-testid="send-button">Send</button></form>
+</main></body></html>`
+		if err := page.Context(ctx).SetDocumentContent(fixture); err != nil {
+			t.Fatalf("set plain-text fixture DOM: %v", err)
+		}
+		answer, err := client.evaluateSnapshotScript(ctx, snapshotJS)
+		if err != nil {
+			t.Fatalf("extract plain-text response: %v", err)
+		}
+		if answer.HasSemanticMarkdown {
+			t.Fatalf("plain-text response was marked as formatted: %+v", answer)
+		}
+		if got, want := answer.response(), `Literal \*asterisks\* remain text.`; got != want {
+			t.Fatalf("Markdown-compatible response = %q, want %q", got, want)
+		}
+		if got, want := answer.ResponseText, "Literal *asterisks* remain text."; got != want {
+			t.Fatalf("raw response = %q, want %q", got, want)
 		}
 	})
 }

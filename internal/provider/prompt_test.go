@@ -40,6 +40,63 @@ func TestCompilePromptRejectsMultimodalContent(t *testing.T) {
 	}
 }
 
+func TestCompilePromptRejectsPaddedToolNames(t *testing.T) {
+	req := chatCompletionRequest{
+		Messages: []message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+		Tools:    []tool{{Type: "function", Function: toolDefinition{Name: " read_file "}}},
+	}
+	_, _, _, err := compilePrompt(req, newToolProtocol("nonce"))
+	if err == nil || !strings.Contains(err.Error(), "leading or trailing whitespace") {
+		t.Fatalf("expected padded tool name error, got %v", err)
+	}
+}
+
+func TestCompilePromptSealsOmittedToolParameters(t *testing.T) {
+	strict := true
+	req := chatCompletionRequest{
+		Messages: []message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+		Tools: []tool{{Type: "function", Function: toolDefinition{
+			Name:   "no_args",
+			Strict: &strict,
+		}}},
+	}
+	_, allowed, enabled, err := compilePrompt(req, newToolProtocol("nonce"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Fatal("tool calls were not enabled")
+	}
+	definition := allowed["no_args"]
+	if got := string(definition.Parameters); got != `{"type":"object","properties":{},"additionalProperties":false}` {
+		t.Fatalf("default parameters = %s", got)
+	}
+	if err := validateToolArguments(`{"unexpected":true}`, definition.Parameters); err == nil {
+		t.Fatal("sealed no-argument schema accepted an unexpected property")
+	}
+	if err := validateToolArguments(`{}`, definition.Parameters); err != nil {
+		t.Fatalf("sealed no-argument schema rejected an empty object: %v", err)
+	}
+}
+
+func TestCompilePromptRejectsNonObjectToolParameters(t *testing.T) {
+	for _, parameters := range []string{`null`, `[]`, `true`, `"schema"`} {
+		t.Run(parameters, func(t *testing.T) {
+			req := chatCompletionRequest{
+				Messages: []message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+				Tools: []tool{{Type: "function", Function: toolDefinition{
+					Name:       "read_file",
+					Parameters: json.RawMessage(parameters),
+				}}},
+			}
+			_, _, _, err := compilePrompt(req, newToolProtocol("nonce"))
+			if err == nil || !strings.Contains(err.Error(), "must be a JSON object") {
+				t.Fatalf("expected object-parameters error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestCompilePromptValidatesResponseFormat(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -167,7 +224,7 @@ func TestResultOutputUsesUnescapedRawResponseForProtocols(t *testing.T) {
 	raw := protocol.open + `{"tool_calls":[{"name":"my_tool","arguments":{"snake_key":"snake_value"}}]}` + protocol.close
 	markdownEscaped := strings.ReplaceAll(raw, "_", `\_`)
 	content, calls, err := (&Server{}).resultOutput(
-		&chatgpt.AskResult{Response: markdownEscaped, RawResponse: raw},
+		&chatgpt.AskResult{Response: markdownEscaped, RawResponse: raw, ResponseFormatted: true},
 		map[string]toolDefinition{
 			"my_tool": {Name: "my_tool", Parameters: json.RawMessage(`{"type":"object"}`)},
 		},
@@ -202,10 +259,30 @@ func TestResultOutputUsesUnescapedRawResponseForPlainText(t *testing.T) {
 	}
 }
 
+func TestResultOutputPreservesSemanticMarkdown(t *testing.T) {
+	content, calls, err := (&Server{}).resultOutput(
+		&chatgpt.AskResult{
+			Response:          "## Heading\n\n- first\n- second",
+			RawResponse:       "Heading\nfirst\nsecond",
+			ResponseFormatted: true,
+		},
+		nil,
+		false,
+		chatCompletionRequest{},
+		newToolProtocol("nonce"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "## Heading\n\n- first\n- second" || len(calls) != 0 {
+		t.Fatalf("unexpected formatted text result: content=%q calls=%#v", content, calls)
+	}
+}
+
 func TestResultOutputUsesRawResponseForStructuredJSON(t *testing.T) {
 	req := chatCompletionRequest{ResponseFormat: json.RawMessage(`{"type":"json_object"}`)}
 	content, calls, err := (&Server{}).resultOutput(
-		&chatgpt.AskResult{Response: `{"snake\_key":"snake\_value"}`, RawResponse: `{"snake_key":"snake_value"}`},
+		&chatgpt.AskResult{Response: `{"snake\_key":"snake\_value"}`, RawResponse: `{"snake_key":"snake_value"}`, ResponseFormatted: true},
 		nil,
 		false,
 		req,

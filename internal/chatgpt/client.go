@@ -20,17 +20,18 @@ import (
 )
 
 var (
-	convIDRe = regexp.MustCompile(`/c/([0-9a-fA-F-]{8,})`)
-	modelRe  = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,62}[A-Za-z0-9])?$`)
+	conversationIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	modelRe          = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,62}[A-Za-z0-9])?$`)
 )
 
 type AskResult struct {
-	Response       string `json:"response" jsonschema:"The complete ChatGPT response as Markdown-compatible text"`
-	RawResponse    string `json:"-"`
-	ElapsedSeconds int64  `json:"elapsed_seconds" jsonschema:"Total request time in seconds"`
-	Model          string `json:"model,omitempty" jsonschema:"Model label verified from the ChatGPT UI, if available"`
-	ChatID         string `json:"chat_id,omitempty" jsonschema:"Conversation id from the URL"`
-	PollCount      int    `json:"poll_count" jsonschema:"Completion checks performed"`
+	Response          string `json:"response" jsonschema:"The complete ChatGPT response as Markdown-compatible text"`
+	RawResponse       string `json:"-"`
+	ResponseFormatted bool   `json:"-"`
+	ElapsedSeconds    int64  `json:"elapsed_seconds" jsonschema:"Total request time in seconds"`
+	Model             string `json:"model,omitempty" jsonschema:"Model label verified from the ChatGPT UI, if available"`
+	ChatID            string `json:"chat_id,omitempty" jsonschema:"Conversation id from the URL"`
+	PollCount         int    `json:"poll_count" jsonschema:"Completion checks performed"`
 }
 
 type Simple struct {
@@ -376,16 +377,31 @@ func validateRestoredConversation(saved clientState, urlString string, state sna
 		return fmt.Errorf("restored conversation still reports an active response")
 	}
 	if !saved.dirty && saved.chatID != "" {
-		match := convIDRe.FindStringSubmatch(urlString)
-		if len(match) != 2 || match[1] != saved.chatID {
+		current, ok := conversationIDFromURL(urlString)
+		if !ok || current != saved.chatID {
 			return fmt.Errorf("restored conversation is %q, want %q", urlString, saved.chatID)
 		}
 		return nil
 	}
-	if convIDRe.MatchString(urlString) || state.TurnCount != 0 || state.AssistantCount != 0 {
+	if _, ok := conversationIDFromURL(urlString); ok || state.TurnCount != 0 || state.AssistantCount != 0 {
 		return fmt.Errorf("restored new-chat state is not empty (url=%q turns=%d assistants=%d)", urlString, state.TurnCount, state.AssistantCount)
 	}
 	return nil
+}
+
+func conversationIDFromURL(rawURL string) (string, bool) {
+	if browser.ValidateChatGPTURL(rawURL) != nil {
+		return "", false
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.HasPrefix(parsed.Path, "/c/") {
+		return "", false
+	}
+	id := strings.TrimPrefix(parsed.Path, "/c/")
+	if !conversationIDRe.MatchString(id) {
+		return "", false
+	}
+	return strings.ToLower(id), true
 }
 
 func conversationURL(chatID string) string {
@@ -499,12 +515,13 @@ func (c *Client) pollAsk(ctx context.Context, start time.Time, before turnMarker
 			}
 			c.chatID = transaction.id
 			return &AskResult{
-				Response:       text,
-				RawResponse:    strings.TrimSpace(answer.ResponseText),
-				ElapsedSeconds: int64(time.Since(start).Seconds()),
-				Model:          c.model,
-				ChatID:         c.chatID,
-				PollCount:      poll.checks,
+				Response:          text,
+				RawResponse:       strings.TrimSpace(answer.ResponseText),
+				ResponseFormatted: answer.HasSemanticMarkdown,
+				ElapsedSeconds:    int64(time.Since(start).Seconds()),
+				Model:             c.model,
+				ChatID:            c.chatID,
+				PollCount:         poll.checks,
 			}, nil
 		}
 
@@ -569,7 +586,7 @@ func (c *Client) NewChat(ctx context.Context) (*Simple, error) {
 	if err != nil {
 		return nil, fmt.Errorf("verify new-chat URL: %w", err)
 	}
-	if convIDRe.MatchString(urlString) || state.TurnCount != 0 || state.AssistantCount != 0 {
+	if _, ok := conversationIDFromURL(urlString); ok || state.TurnCount != 0 || state.AssistantCount != 0 {
 		return nil, fmt.Errorf("new chat did not establish an empty conversation (url=%q turns=%d assistants=%d)", urlString, state.TurnCount, state.AssistantCount)
 	}
 	c.chatID = ""
@@ -967,6 +984,9 @@ func (c *Client) sendPromptToUI(ctx context.Context, transaction *conversationTr
 	if err := c.verifyComposerAttachments(ctx, composer, expectedAttachments); err != nil {
 		return err
 	}
+	if err := c.waitBeforeSubmission(ctx); err != nil {
+		return fmt.Errorf("wait before prompt submission: %w", err)
+	}
 
 	buttonCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -1013,6 +1033,13 @@ func (c *Client) sendPromptToUI(ctx context.Context, transaction *conversationTr
 			return fmt.Errorf("composer send control did not become ready: %w", err)
 		}
 	}
+}
+
+func (c *Client) waitBeforeSubmission(ctx context.Context) error {
+	if c.cfg == nil || c.cfg.DelayMs <= 0 {
+		return nil
+	}
+	return sleepContext(ctx, time.Duration(c.cfg.DelayMs)*time.Millisecond)
 }
 
 // clickCurrentComposerSend re-resolves the composer and its send control after
@@ -1295,8 +1322,8 @@ func (c *Client) ensureConversationBinding(ctx context.Context, requireExisting 
 		return err
 	}
 	current := ""
-	if match := convIDRe.FindStringSubmatch(urlString); len(match) == 2 {
-		current = match[1]
+	if id, ok := conversationIDFromURL(urlString); ok {
+		current = id
 	}
 	if c.chatID == "" {
 		if current == "" && requireExisting {
@@ -1331,8 +1358,8 @@ func (transaction *conversationTransaction) verify(c *Client, ctx context.Contex
 		return err
 	}
 	current := ""
-	if match := convIDRe.FindStringSubmatch(urlString); len(match) == 2 {
-		current = match[1]
+	if id, ok := conversationIDFromURL(urlString); ok {
+		current = id
 	}
 	if transaction.id != "" {
 		if current != transaction.id {

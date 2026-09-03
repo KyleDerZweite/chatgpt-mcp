@@ -12,16 +12,17 @@ import (
 )
 
 type snapshot struct {
-	TurnCount          int    `json:"turnCount"`
-	AssistantCount     int    `json:"assistantCount"`
-	LastAssistantID    string `json:"lastAssistantId"`
-	IsGenerating       bool   `json:"isGenerating"`
-	HasResponseContent bool   `json:"hasResponseContent"`
-	TerminalSignal     bool   `json:"terminalSignal"`
-	ResearchWorkflow   bool   `json:"researchWorkflow"`
-	ContentVersion     string `json:"contentVersion"`
-	ResponseMarkdown   string `json:"responseMarkdown"`
-	ResponseText       string `json:"responseText"`
+	TurnCount           int    `json:"turnCount"`
+	AssistantCount      int    `json:"assistantCount"`
+	LastAssistantID     string `json:"lastAssistantId"`
+	IsGenerating        bool   `json:"isGenerating"`
+	HasResponseContent  bool   `json:"hasResponseContent"`
+	TerminalSignal      bool   `json:"terminalSignal"`
+	ResearchWorkflow    bool   `json:"researchWorkflow"`
+	ContentVersion      string `json:"contentVersion"`
+	ResponseMarkdown    string `json:"responseMarkdown"`
+	ResponseText        string `json:"responseText"`
+	HasSemanticMarkdown bool   `json:"hasSemanticMarkdown"`
 }
 
 // snapshotStateJS intentionally does no response serialization. Long-running
@@ -162,7 +163,9 @@ const snapshotStateJS = `function() {` + snapshotVisibilityJS + `
     assistant.id || ''
   );
   const blocks = contentBlocks(assistant);
-  const hasContent = blocks.some(el => contentText(el) !== '');
+  const hasContent = blocks.some(el => contentText(el) !== '' ||
+    Array.from(el.querySelectorAll('img[src]')).some(image => visible(image) && !excludedStateNode(image))
+  );
   const stopSelectors = [
     '[data-testid="stop-button"]',
     '[data-testid="composer-stop-button"]',
@@ -336,9 +339,36 @@ const snapshotJS = `function() {` + snapshotVisibilityJS + `
 				if (Number.isFinite(itemValue)) ordinal = itemValue;
 			}
 			const prefix = ordered ? String(ordinal) + '. ' : '- ';
-			const body = children(item).trim().replace(/\n/g, '\n  ');
 			if (ordered) ordinal += reversed ? -1 : 1;
-			return prefix + body + '\n';
+
+			const chunks = [];
+			let direct = '';
+			for (const child of item.childNodes) {
+				const tag = child.nodeType === Node.ELEMENT_NODE && child.tagName ? child.tagName.toLowerCase() : '';
+				if (tag === 'ul' || tag === 'ol') {
+					const directText = direct.trim();
+					if (directText) chunks.push({nested: false, text: directText});
+					direct = '';
+					const nestedText = render(child).trim();
+					if (nestedText) chunks.push({nested: true, text: nestedText});
+					continue;
+				}
+				direct += render(child);
+			}
+			const directText = direct.trim();
+			if (directText) chunks.push({nested: false, text: directText});
+
+			const indent = ' '.repeat(prefix.length);
+			let out = '';
+			for (const chunk of chunks) {
+				const indented = chunk.text.replace(/\n/g, '\n' + indent);
+				if (out === '') {
+					out = chunk.nested ? prefix.trimEnd() + '\n' + indent + indented : prefix + indented;
+				} else {
+					out += '\n' + indent + indented;
+				}
+			}
+			return (out || prefix.trimEnd()) + '\n';
 		}).join('') + '\n';
   }
   function render(node) {
@@ -419,6 +449,20 @@ const snapshotJS = `function() {` + snapshotVisibilityJS + `
 		};
 		return blocks.map(read).map(text => text.trim()).filter(Boolean).join('\n\n');
 	}
+	function hasSemanticMarkdown(blocks) {
+		const semanticTags = new Set([
+			'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b', 'em', 'i', 'del', 's',
+			'code', 'pre', 'a', 'img', 'blockquote', 'ul', 'ol', 'table', 'hr'
+		]);
+		return blocks.some(block => [block].concat(Array.from(block.querySelectorAll('*'))).some(node => {
+			if (hiddenOrAction(node)) return false;
+			const tag = node.tagName.toLowerCase();
+			if (!semanticTags.has(tag)) return false;
+			if (tag === 'a' && !node.getAttribute('href')) return false;
+			if (tag === 'img' && !node.getAttribute('src')) return false;
+			return render(node).trim() !== '';
+		}));
+	}
 	const conversation = activeConversationRoot();
 	const turns = Array.from(conversation.querySelectorAll('[data-testid^="conversation-turn-"]')).filter(visible);
 	const assistants = turns.flatMap(turn =>
@@ -442,7 +486,8 @@ const snapshotJS = `function() {` + snapshotVisibilityJS + `
 		hasResponseContent: markdown !== '',
     contentVersion: contentVersion(blocks),
     responseMarkdown: markdown,
-		responseText: raw
+		responseText: raw,
+		hasSemanticMarkdown: markdown !== '' && hasSemanticMarkdown(blocks)
   });
 }`
 
@@ -523,10 +568,10 @@ func (m turnMarker) key() string {
 }
 
 func (s snapshot) hasNewAssistant(before turnMarker) bool {
-	if s.AssistantCount > before.AssistantCount {
-		return true
+	if before.LastAssistantID != "" {
+		return s.LastAssistantID != "" && s.LastAssistantID != before.LastAssistantID
 	}
-	return s.LastAssistantID != "" && before.LastAssistantID != "" && s.LastAssistantID != before.LastAssistantID
+	return s.AssistantCount > before.AssistantCount
 }
 
 func (s snapshot) response() string {

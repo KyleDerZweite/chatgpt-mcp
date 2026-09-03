@@ -10,8 +10,7 @@ currently implemented.
 Today the bridge is deliberately single-threaded:
 
 - `browser.Session` owns one mutable `Page`.
-- `chatgpt.Client` stores one global model, chat ID, provider-page flag, and
-  operation gate.
+- `chatgpt.Client` stores one global model, chat ID, and operation gate.
 - MCP and provider calls are serialized through that gate.
 - Canceling tab creation can abort the whole CDP transport.
 - `Session.Invalidate` discards the entire browser connection.
@@ -98,8 +97,9 @@ MCP changes:
 - `chatgpt_new_chat` may keep a provisional legacy-default entry until its
   first reply is promoted.
 
-Model and dirty-page state belong to a conversation entry. The global
-`model`, `chatID`, and `providerPageOpen` fields should disappear.
+Model and dirty-page state belong to a conversation entry. The global `model`
+and `chatID` fields should disappear; each provider request instead owns the
+state of its ephemeral tab.
 
 ## Locking and lifecycle rules
 

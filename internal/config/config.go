@@ -138,13 +138,18 @@ func envList(name, def string) []string {
 	return values
 }
 
-func defaultStatePaths() (string, string, error) {
+func configuredStatePath(environmentName, leaf string, required bool) (string, error) {
+	if configured := os.Getenv(environmentName); configured != "" {
+		return configured, nil
+	}
+	if !required {
+		return "", nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", "", fmt.Errorf("determine user home directory: %w", err)
+		return "", fmt.Errorf("determine user home directory: %w", err)
 	}
-	stateRoot := filepath.Join(home, ".chatgpt-mcp")
-	return filepath.Join(stateRoot, "Profile"), filepath.Join(stateRoot, "debug"), nil
+	return filepath.Join(home, ".chatgpt-mcp", leaf), nil
 }
 
 func preparePrivateDir(path, purpose string) (string, error) {
@@ -214,8 +219,15 @@ func isNetworkOrDevicePath(path string) bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
-	normalized := strings.ReplaceAll(path, "/", `\`)
-	return strings.HasPrefix(normalized, `\\`)
+	// Accept only ordinary drive-letter volumes. UNC paths, Win32 device paths
+	// (\\.\ and \\?\), Root Local Device paths (\??\), volume GUIDs, and
+	// root-relative object-manager namespaces must all fail closed.
+	volume := filepath.VolumeName(path)
+	if len(volume) != 2 || volume[1] != ':' {
+		return true
+	}
+	letter := volume[0]
+	return (letter < 'A' || letter > 'Z') && (letter < 'a' || letter > 'z')
 }
 
 func canonicalPath(path string) (string, error) {
@@ -305,11 +317,6 @@ func validateProviderModels(models []string, defaultModel string) error {
 }
 
 func Load() (*Config, error) {
-	defaultProfile, defaultDebug, err := defaultStatePaths()
-	if err != nil {
-		return nil, err
-	}
-
 	headless, err := envBool("CHATGPT_HEADLESS", false)
 	if err != nil {
 		return nil, err
@@ -319,6 +326,16 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	screenshots, err := envBool("CHATGPT_SCREENSHOTS", false)
+	if err != nil {
+		return nil, err
+	}
+	cdpURL := env("CHATGPT_CDP_URL", "")
+	managedBrowser := strings.TrimSpace(cdpURL) == "" || strings.EqualFold(strings.TrimSpace(cdpURL), "auto")
+	profileDir, err := configuredStatePath("CHATGPT_MCP_DIR", "Profile", managedBrowser)
+	if err != nil {
+		return nil, err
+	}
+	debugDir, err := configuredStatePath("CHATGPT_DEBUG_DIR", "debug", screenshots)
 	if err != nil {
 		return nil, err
 	}
@@ -388,15 +405,15 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		ProfileDir:            env("CHATGPT_MCP_DIR", defaultProfile),
-		CDPURL:                env("CHATGPT_CDP_URL", ""),
+		ProfileDir:            profileDir,
+		CDPURL:                cdpURL,
 		CDPAllowRemote:        cdpAllowRemote,
 		Headless:              headless,
 		ChromeBin:             env("CHATGPT_CHROME_BIN", ""),
 		DelayMs:               delayMs,
 		DefaultTimeoutMinutes: timeoutMinutes,
 		MaxTimeoutMinutes:     maxTimeoutMinutes,
-		DebugDir:              env("CHATGPT_DEBUG_DIR", defaultDebug),
+		DebugDir:              debugDir,
 		Screenshots:           screenshots,
 		DebugMaxFiles:         debugMaxFiles,
 		UploadsEnabled:        uploadsEnabled,

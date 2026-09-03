@@ -149,6 +149,22 @@ func TestCompletionMapsReturnedDeadlineToGatewayTimeout(t *testing.T) {
 	}
 }
 
+func TestNonStreamingCompletionRejectsResultReturnedAfterDeadline(t *testing.T) {
+	backend := &fakeCompleter{complete: func(ctx context.Context, _, _ string) (*chatgpt.AskResult, error) {
+		<-ctx.Done()
+		return &chatgpt.AskResult{Response: "too late"}, nil
+	}}
+	server := testServer(t, backend, func(opts *Options) { opts.Timeout = 10 * time.Millisecond })
+	body := `{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`
+	response := request(t, server, http.MethodPost, "/v1/chat/completions", body, "")
+	if response.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusGatewayTimeout, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "too late") {
+		t.Fatalf("late backend result was returned: %s", response.Body.String())
+	}
+}
+
 func TestNonStreamingCompletion(t *testing.T) {
 	backend := &fakeCompleter{fn: func(_ context.Context, prompt, model string) *chatgpt.AskResult {
 		if !strings.Contains(prompt, `"role": "system"`) || !strings.Contains(prompt, "say hello") {

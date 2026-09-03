@@ -54,19 +54,46 @@ func TestUploadsAreDisabledByDefault(t *testing.T) {
 	}
 }
 
-func TestUploadsRejectRemoteCDPEndpoint(t *testing.T) {
+func TestUploadsRejectExplicitCDPEndpoint(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	path := writeUploadFixture(t, filepath.Join(root, "safe.txt"), "safe")
 	client := uploadClient(root)
 	for _, endpoint := range []string{
+		"auto",
+		"http://127.0.0.1:9222",
 		"wss://browser.example/devtools/browser/id",
 		"http://localhost.:9222",
 	} {
 		client.cfg.CDPURL = endpoint
-		if _, err := client.validateUploadPaths(context.Background(), []string{path}); err == nil || !strings.Contains(err.Error(), "remote CDP") {
-			t.Fatalf("remote-CDP upload error for %q = %v", endpoint, err)
+		if _, err := client.validateUploadPaths(context.Background(), []string{path}); err == nil || !strings.Contains(err.Error(), "bridge-launched local browser") {
+			t.Fatalf("explicit-CDP upload error for %q = %v", endpoint, err)
+		}
+	}
+}
+
+func TestWindowsNetworkAndDevicePathDetection(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path namespaces")
+	}
+	for _, path := range []string{`C:\safe\file.txt`, `d:/safe/file.txt`} {
+		if isNetworkPath(path) {
+			t.Errorf("ordinary local path %q was rejected", path)
+		}
+	}
+	for _, path := range []string{
+		`\\server\share\file.txt`,
+		`//server/share/file.txt`,
+		`\\?\C:\safe\file.txt`,
+		`\\.\C:\safe\file.txt`,
+		`\??\C:\safe\file.txt`,
+		`\??\UNC\server\share\file.txt`,
+		`\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\file.txt`,
+		`\Device\HarddiskVolume1\file.txt`,
+	} {
+		if !isNetworkPath(path) {
+			t.Errorf("network/device path %q was accepted", path)
 		}
 	}
 }

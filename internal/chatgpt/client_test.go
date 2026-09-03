@@ -2,12 +2,18 @@ package chatgpt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"chatgpt-mcp/internal/config"
+)
+
+const (
+	testConversationID      = "11111111-2222-3333-4444-555555555555"
+	otherTestConversationID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 )
 
 func TestModelMatchesVerifiedUILabel(t *testing.T) {
@@ -79,6 +85,43 @@ func TestConversationURLPathEscapesIdentifier(t *testing.T) {
 	}
 }
 
+func TestConversationIDRequiresExactValidRoute(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{name: "conversation", url: "https://chatgpt.com/c/" + testConversationID, want: testConversationID},
+		{name: "query and fragment", url: "https://chatgpt.com/c/" + testConversationID + "?model=gpt-5#response", want: testConversationID},
+		{name: "canonicalizes id case", url: "https://chatgpt.com/c/AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", want: otherTestConversationID},
+		{name: "query substring", url: "https://chatgpt.com/?next=/c/" + testConversationID},
+		{name: "path prefix", url: "https://chatgpt.com/g/custom/c/" + testConversationID},
+		{name: "trailing path", url: "https://chatgpt.com/c/" + testConversationID + "/share"},
+		{name: "trailing slash", url: "https://chatgpt.com/c/" + testConversationID + "/"},
+		{name: "invalid suffix", url: "https://chatgpt.com/c/" + testConversationID + "x"},
+		{name: "short id", url: "https://chatgpt.com/c/12345678-abcd"},
+		{name: "wrong origin", url: "https://evil.example/c/" + testConversationID},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := conversationIDFromURL(test.url)
+			if test.want == "" {
+				if ok || got != "" {
+					t.Fatalf("conversationIDFromURL(%q) = %q, %t; want no conversation", test.url, got, ok)
+				}
+				return
+			}
+			if !ok || got != test.want {
+				t.Fatalf("conversationIDFromURL(%q) = %q, %t; want %q, true", test.url, got, ok, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateRestoredConversation(t *testing.T) {
 	t.Parallel()
 
@@ -90,12 +133,13 @@ func TestValidateRestoredConversation(t *testing.T) {
 		ok    bool
 	}{
 		{name: "empty state", url: "https://chatgpt.com/", state: snapshot{}, ok: true},
-		{name: "existing conversation", saved: clientState{chatID: "12345678-abcd"}, url: "https://chatgpt.com/c/12345678-abcd", state: snapshot{TurnCount: 2, AssistantCount: 1}, ok: true},
+		{name: "existing conversation", saved: clientState{chatID: testConversationID}, url: "https://chatgpt.com/c/" + testConversationID, state: snapshot{TurnCount: 2, AssistantCount: 1}, ok: true},
 		{name: "active generation", url: "https://chatgpt.com/", state: snapshot{IsGenerating: true}},
-		{name: "empty state redirected", url: "https://chatgpt.com/c/12345678-abcd", state: snapshot{TurnCount: 2, AssistantCount: 1}},
+		{name: "empty state redirected", url: "https://chatgpt.com/c/" + testConversationID, state: snapshot{TurnCount: 2, AssistantCount: 1}},
+		{name: "query substring is not a conversation", url: "https://chatgpt.com/?next=/c/" + testConversationID, state: snapshot{}, ok: true},
 		{name: "empty URL with stale turns", url: "https://chatgpt.com/", state: snapshot{TurnCount: 1}},
-		{name: "wrong existing conversation", saved: clientState{chatID: "12345678-abcd"}, url: "https://chatgpt.com/c/87654321-dcba", state: snapshot{TurnCount: 2, AssistantCount: 1}},
-		{name: "dirty state must restore blank", saved: clientState{dirty: true, chatID: "12345678-abcd"}, url: "https://chatgpt.com/c/12345678-abcd", state: snapshot{TurnCount: 2, AssistantCount: 1}},
+		{name: "wrong existing conversation", saved: clientState{chatID: testConversationID}, url: "https://chatgpt.com/c/" + otherTestConversationID, state: snapshot{TurnCount: 2, AssistantCount: 1}},
+		{name: "dirty state must restore blank", saved: clientState{dirty: true, chatID: testConversationID}, url: "https://chatgpt.com/c/" + testConversationID, state: snapshot{TurnCount: 2, AssistantCount: 1}},
 	}
 	for _, test := range tests {
 		test := test
@@ -168,6 +212,34 @@ func TestSleepContextHonorsCancellation(t *testing.T) {
 	cancel()
 	if err := sleepContext(ctx, time.Minute); !errors.Is(err, context.Canceled) {
 		t.Fatalf("sleepContext error = %v, want context.Canceled", err)
+	}
+}
+
+func TestConfiguredSubmissionDelayHonorsCancellation(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{cfg: &config.Config{DelayMs: int(time.Minute / time.Millisecond)}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.waitBeforeSubmission(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitBeforeSubmission error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAskResultFormattingMetadataIsInternal(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := json.Marshal(AskResult{
+		Response:          "**formatted**",
+		RawResponse:       "formatted",
+		ResponseFormatted: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal AskResult: %v", err)
+	}
+	if strings.Contains(string(encoded), "RawResponse") || strings.Contains(string(encoded), "ResponseFormatted") ||
+		strings.Contains(string(encoded), "raw_response") || strings.Contains(string(encoded), "response_formatted") {
+		t.Fatalf("internal response metadata leaked into JSON: %s", encoded)
 	}
 }
 

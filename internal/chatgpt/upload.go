@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"chatgpt-mcp/internal/browser"
 )
 
 const uploadStagingPrefix = "chatgpt-mcp-upload-"
@@ -75,8 +73,8 @@ func (c *Client) validateUploadPlan(ctx context.Context, paths []string) (*valid
 	if !c.cfg.UploadsEnabled {
 		return nil, fmt.Errorf("file uploads are disabled; set CHATGPT_UPLOAD_ENABLED=true and configure CHATGPT_UPLOAD_ALLOWED_ROOTS to opt in")
 	}
-	if browser.IsRemoteCDPEndpoint(c.cfg.CDPURL) {
-		return nil, fmt.Errorf("file uploads are unavailable with a remote CDP endpoint because local paths cannot be verified on the remote browser host")
+	if strings.TrimSpace(c.cfg.CDPURL) != "" {
+		return nil, fmt.Errorf("file uploads require a bridge-launched local browser; unset CHATGPT_CDP_URL because an attached or tunneled browser's filesystem identity cannot be verified")
 	}
 	if len(c.cfg.UploadAllowedRoots) == 0 {
 		return nil, fmt.Errorf("file uploads require at least one CHATGPT_UPLOAD_ALLOWED_ROOTS entry")
@@ -337,8 +335,16 @@ func isNetworkPath(path string) bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
-	normalized := strings.ReplaceAll(path, "/", `\`)
-	return strings.HasPrefix(normalized, `\\`)
+	// Accept only ordinary drive-letter volumes. UNC paths, Win32 device paths
+	// (\\.\ and \\?\), Root Local Device paths (\??\), volume GUIDs, and
+	// root-relative device namespaces must all fail closed. filepath.VolumeName
+	// recognizes these forms even when they use mixed separators.
+	volume := filepath.VolumeName(path)
+	if len(volume) != 2 || volume[1] != ':' {
+		return true
+	}
+	letter := volume[0]
+	return (letter < 'A' || letter > 'Z') && (letter < 'a' || letter > 'z')
 }
 
 func containingUploadRoot(path string, roots []validatedUploadRoot) (int, string) {

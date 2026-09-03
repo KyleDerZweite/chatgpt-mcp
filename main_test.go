@@ -848,6 +848,73 @@ func TestValidateListen(t *testing.T) {
 	}
 }
 
+type addressOnlyListener struct {
+	addr net.Addr
+}
+
+func (l *addressOnlyListener) Accept() (net.Conn, error) { return nil, errors.New("not implemented") }
+func (l *addressOnlyListener) Close() error              { return nil }
+func (l *addressOnlyListener) Addr() net.Addr            { return l.addr }
+
+func TestValidateBoundProviderListenerUsesActualAddress(t *testing.T) {
+	strongKey := strings.Repeat("k", minimumRemoteAPIKeyBytes)
+	tests := []struct {
+		name         string
+		addr         net.Addr
+		allowRemote  bool
+		apiKey       string
+		certFile     string
+		keyFile      string
+		wantLoopback bool
+		wantErr      bool
+	}{
+		{
+			name:         "IPv4 loopback remains local",
+			addr:         &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8787},
+			wantLoopback: true,
+		},
+		{
+			name:    "non-loopback cannot inherit localhost exemption",
+			addr:    &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 8787},
+			wantErr: true,
+		},
+		{
+			name:        "unspecified requires remote safeguards",
+			addr:        &net.TCPAddr{IP: net.IPv4zero, Port: 8787},
+			allowRemote: true,
+			wantErr:     true,
+		},
+		{
+			name:        "authenticated TLS remote binding",
+			addr:        &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 8787},
+			allowRemote: true,
+			apiKey:      strongKey,
+			certFile:    "server.crt",
+			keyFile:     "server.key",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			listener := &addressOnlyListener{addr: test.addr}
+			loopback, err := validateBoundProviderListener(listener, test.allowRemote, test.apiKey, test.certFile, test.keyFile)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateBoundProviderListener() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if loopback != test.wantLoopback {
+				t.Fatalf("validateBoundProviderListener() loopback = %t, want %t", loopback, test.wantLoopback)
+			}
+		})
+	}
+
+	if err := validateListen("localhost:8787", false, "", "", ""); err != nil {
+		t.Fatalf("logical localhost validation failed: %v", err)
+	}
+	listener := &addressOnlyListener{addr: &net.TCPAddr{IP: net.IPv6unspecified, Port: 8787}}
+	if _, err := validateBoundProviderListener(listener, false, "", "", ""); err == nil {
+		t.Fatal("unspecified actual binding inherited the logical localhost exemption")
+	}
+}
+
 func TestMCPModeHelpDoesNotStartTransport(t *testing.T) {
 	t.Setenv("CHATGPT_MCP_DIR", filepath.Join(t.TempDir(), "profile"))
 	t.Setenv("CHATGPT_HEADLESS", "not-a-boolean")

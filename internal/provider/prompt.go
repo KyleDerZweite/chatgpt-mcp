@@ -129,6 +129,9 @@ func compilePrompt(req chatCompletionRequest, protocol toolProtocol) (string, ma
 		if name == "" {
 			return "", nil, false, fmt.Errorf("tools[%d].function.name is required", i)
 		}
+		if name != item.Function.Name {
+			return "", nil, false, fmt.Errorf("tools[%d].function.name must not contain leading or trailing whitespace", i)
+		}
 		if !toolNamePattern.MatchString(name) {
 			return "", nil, false, fmt.Errorf("tools[%d].function.name %q is invalid", i, name)
 		}
@@ -136,12 +139,12 @@ func compilePrompt(req chatCompletionRequest, protocol toolProtocol) (string, ma
 			return "", nil, false, fmt.Errorf("duplicate tool name %q", name)
 		}
 		if len(item.Function.Parameters) == 0 {
-			item.Function.Parameters = json.RawMessage(`{"type":"object","properties":{}}`)
+			item.Function.Parameters = json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
 		}
 		if !json.Valid(item.Function.Parameters) {
 			return "", nil, false, fmt.Errorf("tools[%d].function.parameters is not valid JSON", i)
 		}
-		if err := validateToolSchema(item.Function.Parameters); err != nil {
+		if err := validateToolParameters(item.Function.Parameters); err != nil {
 			return "", nil, false, fmt.Errorf("tools[%d].function.parameters: %w", i, err)
 		}
 		allowed[name] = item.Function
@@ -598,6 +601,14 @@ func validateToolSchema(raw json.RawMessage) error {
 		return fmt.Errorf("unresolvable JSON Schema: %w", err)
 	}
 	return nil
+}
+
+func validateToolParameters(raw json.RawMessage) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return fmt.Errorf("must be a JSON object")
+	}
+	return validateToolSchema(raw)
 }
 
 func validateToolArguments(arguments string, rawSchema json.RawMessage) error {

@@ -2,6 +2,8 @@ package browser
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -157,6 +159,104 @@ func TestResolveControlURL(t *testing.T) {
 	if got, err := resolveControlURL(context.Background(), direct); err != nil || got != direct {
 		t.Fatalf("direct WebSocket URL = %q, %v", got, err)
 	}
+}
+
+func TestConnectWebSocketHandshakeHonorsCancellation(t *testing.T) {
+	for _, scheme := range []string{"ws", "wss"} {
+		t.Run(scheme, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			accepted := make(chan net.Conn, 1)
+			go func() {
+				connection, acceptErr := listener.Accept()
+				if acceptErr == nil {
+					accepted <- connection
+				}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			_, browserCancel, transport, err := connect(ctx, scheme+"://"+listener.Addr().String()+"/devtools/browser/stalled")
+			if browserCancel != nil || transport != nil {
+				t.Fatal("stalled connection returned live browser handles")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("connect() error = %v, want context deadline exceeded", err)
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("stalled WebSocket handshake returned after %s", elapsed)
+			}
+			select {
+			case connection := <-accepted:
+				_ = connection.Close()
+			case <-time.After(time.Second):
+				t.Fatal("test server did not accept the WebSocket connection")
+			}
+		})
+	}
+}
+
+func TestLoopbackWebSocketValidatesDialedPeer(t *testing.T) {
+	endpoint, err := url.Parse("ws://localhost:9222/devtools/browser/id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, _, err := newCDPWebSocketDialer(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	defer server.Close()
+	dialer.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		return &reportedRemoteConn{
+			Conn:   client,
+			remote: &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 9222},
+		}, nil
+	}
+	if _, err := dialer.DialContext(context.Background(), "tcp", endpoint.Host); err == nil || !strings.Contains(err.Error(), "outside loopback") {
+		t.Fatalf("DialContext() error = %v, want non-loopback peer rejection", err)
+	}
+}
+
+func TestSecureWebSocketDialerUsesVerifiedTLS(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	endpoint, err := url.Parse("wss" + strings.TrimPrefix(server.URL, "https"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, normalizedURL, err := newCDPWebSocketDialer(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dialer.tlsConfig.InsecureSkipVerify {
+		t.Fatal("WSS dialer disabled certificate verification")
+	}
+	if dialer.tlsConfig.MinVersion < tls.VersionTLS12 {
+		t.Fatalf("WSS minimum TLS version = %x, want TLS 1.2 or newer", dialer.tlsConfig.MinVersion)
+	}
+	if dialer.tlsConfig.ServerName != endpoint.Hostname() {
+		t.Fatalf("WSS server name = %q, want %q", dialer.tlsConfig.ServerName, endpoint.Hostname())
+	}
+	certificatePool := x509.NewCertPool()
+	certificatePool.AddCert(server.Certificate())
+	dialer.tlsConfig.RootCAs = certificatePool
+	parsedNormalized, err := url.Parse(normalizedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	connection, err := dialer.DialContext(ctx, "tcp", parsedNormalized.Host)
+	if err != nil {
+		t.Fatalf("verified WSS dial: %v", err)
+	}
+	dialer.stopSetup()
+	_ = connection.Close()
 }
 
 func TestCDPEndpointLoopbackClassification(t *testing.T) {

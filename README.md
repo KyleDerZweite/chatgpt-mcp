@@ -58,7 +58,9 @@ Read this before running the server:
   key of at least 32 bytes, and a configured TLS certificate/private-key pair.
   The built-in HTTPS server requires TLS 1.2 or newer. Keep a reverse proxy and
   this bridge on the same host with the bridge bound to loopback if the proxy
-  terminates TLS instead.
+  terminates TLS instead. Configure the proxy to replace the upstream `Host`
+  header with `127.0.0.1`; the loopback listener deliberately rejects external
+  hostnames even when the TCP peer is local.
 - Protect the Chrome profile as a secret: it contains your authenticated session.
   Failure screenshots can contain prompts, answers, filenames, and other account
   data. Neither should be committed or shared.
@@ -73,6 +75,9 @@ Read this before running the server:
   complete control of the authenticated browser: it requires an explicit opt-in
   and `https://` or `wss://`, and secure discovery may not downgrade to plain
   WebSocket. Prefer a loopback endpoint reached through a trusted secure tunnel.
+  File uploads are unavailable in every manual-CDP mode, including a loopback
+  tunnel or `CHATGPT_CDP_URL=auto`; uploads require a browser launched by this
+  bridge with `CHATGPT_CDP_URL` unset.
 - Do not manually type, send, or navigate in the automation tab while a tool is
   running, and do not share its CDP target with another controller. The server
   serializes MCP calls and detects target/conversation drift, but it cannot make
@@ -233,9 +238,11 @@ local upload directory and review them before calling the tool.
 These controls reduce accidental disclosure; they do not turn upload into a
 low-trust capability. A connected agent can upload any qualifying file within an
 allowed root without a separate interactive confirmation from this server.
-Uploads are rejected when the browser is reached through a non-loopback CDP
-endpoint: file inputs interpret path strings on the browser host, so this bridge
-cannot prove that a remote Chrome would attach the locally validated bytes.
+Uploads are rejected whenever `CHATGPT_CDP_URL` is nonblank, including `auto`, a
+direct loopback endpoint, or a loopback tunnel. File inputs interpret path
+strings on the browser host, and a loopback TCP peer does not prove that Chrome
+shares this process's filesystem. Leave `CHATGPT_CDP_URL` unset so the bridge
+launches and owns the local browser used for uploads.
 
 ## OpenCode provider configuration
 
@@ -321,7 +328,10 @@ $env:CHATGPT_PROVIDER_TLS_KEY_FILE = 'C:\secure\chatgpt-bridge.key'
 Clients must then use `https://<certificate-hostname>:8787/v1` and trust the
 certificate issuer. Protect the private-key file with operating-system access
 controls. If a TLS reverse proxy runs on the same machine, keep this process on
-its default loopback HTTP address and expose only the authenticated HTTPS proxy.
+its default loopback HTTP address, configure the proxy's upstream request with
+`Host: 127.0.0.1`, and expose only the authenticated HTTPS proxy. Without that
+rewrite, the provider's loopback Host-header guard returns `403 Forbidden` for
+the proxy's external hostname.
 
 ### Provider compatibility and limitations
 

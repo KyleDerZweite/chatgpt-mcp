@@ -559,22 +559,27 @@ func makeHTTPServer(baseCtx context.Context, cfg *config.Config, backend provide
 	if err := validateListen(addr, cfg.ProviderAllowRemote, cfg.ProviderAPIKey, cfg.ProviderTLSCertFile, cfg.ProviderTLSKeyFile); err != nil {
 		return nil, nil, nil, err
 	}
-	host, _, _ := net.SplitHostPort(addr) // validateListen already checked this value.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	boundLoopback, err := validateBoundProviderListener(listener, cfg.ProviderAllowRemote, cfg.ProviderAPIKey, cfg.ProviderTLSCertFile, cfg.ProviderTLSKeyFile)
+	if err != nil {
+		_ = listener.Close()
+		return nil, nil, nil, err
+	}
 	handler, err := provider.New(backend, provider.Options{
 		APIKey:            cfg.ProviderAPIKey,
 		Models:            cfg.ProviderModels,
 		DefaultModel:      cfg.ProviderDefaultModel,
 		Timeout:           time.Duration(cfg.DefaultTimeoutMinutes) * time.Minute,
 		HeartbeatInterval: 15 * time.Second,
-		AllowRemote:       !isLoopbackAddress(host),
+		AllowRemote:       !boundLoopback,
 		Logger:            log.Default(),
 	})
 	if err != nil {
+		_ = listener.Close()
 		return nil, nil, nil, err
-	}
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 	requests := newActivityTracker()
 	trackedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -705,12 +710,31 @@ func validateListen(addr string, allowRemote bool, apiKey, tlsCertFile, tlsKeyFi
 	if err != nil {
 		return fmt.Errorf("invalid provider listen address %q: %w", addr, err)
 	}
+	return validateProviderExposure(isLoopbackAddress(host), addr, allowRemote, apiKey, tlsCertFile, tlsKeyFile)
+}
+
+func validateBoundProviderListener(listener net.Listener, allowRemote bool, apiKey, tlsCertFile, tlsKeyFile string) (bool, error) {
+	if listener == nil || listener.Addr() == nil {
+		return false, fmt.Errorf("provider listener has no bound address")
+	}
+	bound, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || bound.IP == nil {
+		return false, fmt.Errorf("provider listener returned an unexpected bound address %q", listener.Addr().String())
+	}
+	loopback := bound.IP.IsLoopback()
+	if err := validateProviderExposure(loopback, listener.Addr().String(), allowRemote, apiKey, tlsCertFile, tlsKeyFile); err != nil {
+		return false, fmt.Errorf("bound provider listener is unsafe: %w", err)
+	}
+	return loopback, nil
+}
+
+func validateProviderExposure(loopback bool, addr string, allowRemote bool, apiKey, tlsCertFile, tlsKeyFile string) error {
 	certConfigured := strings.TrimSpace(tlsCertFile) != ""
 	keyConfigured := strings.TrimSpace(tlsKeyFile) != ""
 	if certConfigured != keyConfigured {
 		return fmt.Errorf("CHATGPT_PROVIDER_TLS_CERT_FILE and CHATGPT_PROVIDER_TLS_KEY_FILE must be set together")
 	}
-	if isLoopbackAddress(host) {
+	if loopback {
 		return nil
 	}
 	if !allowRemote {

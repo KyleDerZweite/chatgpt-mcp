@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -811,8 +812,23 @@ func loopbackOnlyHTTPClient(base *http.Client) (*http.Client, error) {
 }
 
 func connect(requestCtx context.Context, controlURL string) (*rod.Browser, context.CancelFunc, *cdp.WebSocket, error) {
-	transport := &cdp.WebSocket{}
-	if err := transport.Connect(requestCtx, controlURL, nil); err != nil {
+	endpoint, err := url.Parse(controlURL)
+	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") {
+		return nil, nil, nil, fmt.Errorf("invalid WebSocket endpoint")
+	}
+	dialer, normalizedURL, err := newCDPWebSocketDialer(endpoint)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	transport := &cdp.WebSocket{Dialer: dialer}
+	if err := transport.Connect(requestCtx, normalizedURL, nil); err != nil {
+		dialer.stopSetup()
+		if dialer.connection != nil {
+			_ = transport.Close()
+		}
+		if requestErr := requestCtx.Err(); requestErr != nil {
+			return nil, nil, nil, requestErr
+		}
 		return nil, nil, nil, err
 	}
 	browserCtx, browserCancel := context.WithCancel(context.Background())
@@ -821,6 +837,12 @@ func connect(requestCtx context.Context, controlURL string) (*rod.Browser, conte
 		browserCancel()
 		_ = transport.Close()
 	})
+	if err := dialer.finishSetup(requestCtx); err != nil {
+		stopCancellation()
+		browserCancel()
+		_ = transport.Close()
+		return nil, nil, nil, err
+	}
 	if err := connected.Connect(); err != nil {
 		stopCancellation()
 		browserCancel()
@@ -836,6 +858,130 @@ func connect(requestCtx context.Context, controlURL string) (*rod.Browser, conte
 		return nil, nil, nil, context.Canceled
 	}
 	return connected, browserCancel, transport, nil
+}
+
+// cdpWebSocketDialer owns only the TCP/TLS setup phase. Rod's WebSocket
+// implementation performs the HTTP upgrade after DialContext returns, so the
+// dialer keeps the request context armed against the socket until connect has
+// observed a successful upgrade. This makes a peer that accepts TCP but never
+// answers the upgrade request cancellation-aware as well.
+type cdpWebSocketDialer struct {
+	scheme          string
+	requireLoopback bool
+	dialContext     func(context.Context, string, string) (net.Conn, error)
+	tlsConfig       *tls.Config
+
+	connection net.Conn
+	stop       func() bool
+	stopDone   <-chan struct{}
+}
+
+func newCDPWebSocketDialer(endpoint *url.URL) (*cdpWebSocketDialer, string, error) {
+	if endpoint == nil || endpoint.Host == "" || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") {
+		return nil, "", fmt.Errorf("endpoint must use ws or wss")
+	}
+	host := endpoint.Hostname()
+	if host == "" {
+		return nil, "", fmt.Errorf("WebSocket endpoint has no host")
+	}
+	port := endpoint.Port()
+	if port == "" {
+		if endpoint.Scheme == "wss" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	normalized := *endpoint
+	normalized.Host = net.JoinHostPort(host, port)
+	networkDialer := new(net.Dialer)
+	dialer := &cdpWebSocketDialer{
+		scheme:          endpoint.Scheme,
+		requireLoopback: isLoopbackCDPHost(host),
+		dialContext:     networkDialer.DialContext,
+		tlsConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: host,
+		},
+	}
+	return dialer, normalized.String(), nil
+}
+
+func (d *cdpWebSocketDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	connection, err := d.dialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCDPWebSocketPeer(connection, d.requireLoopback); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	if d.scheme == "wss" {
+		tlsConnection := tls.Client(connection, d.tlsConfig.Clone())
+		if err := tlsConnection.HandshakeContext(ctx); err != nil {
+			_ = connection.Close()
+			if contextErr := ctx.Err(); contextErr != nil {
+				return nil, contextErr
+			}
+			return nil, err
+		}
+		connection = tlsConnection
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := connection.SetDeadline(deadline); err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+	}
+	stopDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = connection.Close()
+		close(stopDone)
+	})
+	d.connection = connection
+	d.stop = stop
+	d.stopDone = stopDone
+	return connection, nil
+}
+
+func validateCDPWebSocketPeer(connection net.Conn, requireLoopback bool) error {
+	if !requireLoopback {
+		return nil
+	}
+	remote, ok := connection.RemoteAddr().(*net.TCPAddr)
+	if !ok || remote.IP == nil || !remote.IP.IsLoopback() {
+		return fmt.Errorf("CDP WebSocket resolved outside loopback")
+	}
+	return nil
+}
+
+func (d *cdpWebSocketDialer) finishSetup(ctx context.Context) error {
+	if d.stop == nil || d.connection == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("WebSocket dialer did not establish a connection")
+	}
+	if !d.stop() {
+		<-d.stopDone
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.connection.SetDeadline(time.Time{})
+}
+
+func (d *cdpWebSocketDialer) stopSetup() {
+	if d.stop == nil {
+		return
+	}
+	if !d.stop() {
+		<-d.stopDone
+	}
 }
 
 func (s *Session) Navigate(url string) error {

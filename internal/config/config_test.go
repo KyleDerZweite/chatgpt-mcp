@@ -57,6 +57,21 @@ func cleanTestEnvironment(t *testing.T) statePaths {
 	return paths
 }
 
+func clearUserHomeEnvironment(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"USERPROFILE", "HOMEDRIVE", "HOMEPATH"} {
+			t.Setenv(name, "")
+		}
+		return
+	}
+	if runtime.GOOS == "plan9" {
+		t.Setenv("home", "")
+		return
+	}
+	t.Setenv("HOME", "")
+}
+
 func mustLoad(t *testing.T) *Config {
 	t.Helper()
 	cfg, err := Load()
@@ -103,6 +118,60 @@ func TestUploadConfigurationDefaultsToDisabled(t *testing.T) {
 	}
 	if _, err := os.Stat(paths.debug); !os.IsNotExist(err) {
 		t.Fatalf("disabled screenshot directory stat error = %v, want not-exist", err)
+	}
+}
+
+func TestExplicitStatePathsDoNotRequireUserHome(t *testing.T) {
+	paths := cleanTestEnvironment(t)
+	clearUserHomeEnvironment(t)
+	t.Setenv("CHATGPT_SCREENSHOTS", "true")
+
+	cfg := mustLoad(t)
+	if cfg.ProfileDir != paths.profile || cfg.DebugDir != paths.debug {
+		t.Fatalf("state paths = profile %q, debug %q; want %q and %q", cfg.ProfileDir, cfg.DebugDir, paths.profile, paths.debug)
+	}
+	for _, path := range []string{paths.profile, paths.debug} {
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Fatalf("explicit state path %q was not prepared as a directory: info=%v err=%v", path, info, err)
+		}
+	}
+}
+
+func TestUnusedStatePathDefaultsDoNotRequireUserHome(t *testing.T) {
+	cleanTestEnvironment(t)
+	t.Setenv("CHATGPT_MCP_DIR", "")
+	t.Setenv("CHATGPT_DEBUG_DIR", "")
+	t.Setenv("CHATGPT_CDP_URL", "ws://127.0.0.1:9222/devtools/browser/id")
+	clearUserHomeEnvironment(t)
+
+	cfg := mustLoad(t)
+	if cfg.ProfileDir != "" || cfg.DebugDir != "" {
+		t.Fatalf("unused state paths = profile %q, debug %q; want both empty", cfg.ProfileDir, cfg.DebugDir)
+	}
+}
+
+func TestWindowsNetworkAndDevicePathClassification(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path namespaces are Windows-specific")
+	}
+	local := filepath.Join(t.TempDir(), "child")
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: local, want: false},
+		{path: `\\server\share\directory`, want: true},
+		{path: `\\?\C:\directory`, want: true},
+		{path: `\\.\PhysicalDrive0`, want: true},
+		{path: `\??\C:\directory`, want: true},
+		{path: `\??\UNC\server\share\directory`, want: true},
+		{path: `\??\Volume{00000000-0000-0000-0000-000000000000}\directory`, want: true},
+		{path: `\Device\HarddiskVolume1\directory`, want: true},
+	}
+	for _, test := range tests {
+		if got := isNetworkOrDevicePath(test.path); got != test.want {
+			t.Errorf("isNetworkOrDevicePath(%q) = %t, want %t", test.path, got, test.want)
+		}
 	}
 }
 
@@ -300,11 +369,22 @@ func TestEnabledUploadsRequireValidExistingLocalRoots(t *testing.T) {
 		}, contains: "is not a directory"},
 	}
 	if runtime.GOOS == "windows" {
-		tests = append(tests, struct {
-			name     string
-			root     func(*testing.T) string
-			contains string
-		}{name: "network path", root: func(*testing.T) string { return `\\server\share` }, contains: "must be local"})
+		for _, test := range []struct {
+			name string
+			path string
+		}{
+			{name: "network path", path: `\\server\share`},
+			{name: "root local device drive path", path: `\??\C:\upload`},
+			{name: "root local device UNC path", path: `\??\UNC\server\share\upload`},
+			{name: "extended volume path", path: `\\?\Volume{00000000-0000-0000-0000-000000000000}\upload`},
+		} {
+			test := test
+			tests = append(tests, struct {
+				name     string
+				root     func(*testing.T) string
+				contains string
+			}{name: test.name, root: func(*testing.T) string { return test.path }, contains: "must be local"})
+		}
 	}
 
 	for _, test := range tests {

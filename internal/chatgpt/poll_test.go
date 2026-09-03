@@ -54,6 +54,45 @@ func TestPollerUsesAssistantIdentityWhenCountIsUnchanged(t *testing.T) {
 	}
 }
 
+func TestPollerRejectsCountIncreaseWhenAssistantIdentityIsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	poll, now := controlledPoll(turnMarker{AssistantCount: 1, LastAssistantID: "assistant-old"})
+	duplicate := snapshot{
+		AssistantCount:     2,
+		LastAssistantID:    "assistant-old",
+		HasResponseContent: true,
+		TerminalSignal:     true,
+		ContentVersion:     "old-v1",
+		ResponseMarkdown:   "previous answer",
+	}
+	for range 3 {
+		*now = now.Add(time.Second)
+		if poll.complete(duplicate) {
+			t.Fatal("poller treated a duplicate rendering of the old assistant as a new turn")
+		}
+	}
+}
+
+func TestPollerRejectsCountIncreaseWhenDurableAssistantIdentityDisappears(t *testing.T) {
+	t.Parallel()
+
+	poll, now := controlledPoll(turnMarker{AssistantCount: 1, LastAssistantID: "assistant-old"})
+	missingIdentity := snapshot{
+		AssistantCount:     2,
+		HasResponseContent: true,
+		TerminalSignal:     true,
+		ContentVersion:     "old-v1",
+		ResponseMarkdown:   "previous answer",
+	}
+	for range 3 {
+		*now = now.Add(time.Second)
+		if poll.complete(missingIdentity) {
+			t.Fatal("poller fell back to assistant count after a durable identity disappeared")
+		}
+	}
+}
+
 func TestPollerWaitsForExplicitGenerationStateToClear(t *testing.T) {
 	t.Parallel()
 
