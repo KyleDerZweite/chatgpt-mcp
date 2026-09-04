@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "chatgpt-browser": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "ChatGPT Browser (experimental)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "supportsStructuredOutputs": true,
+        "timeout": 1900000,
+        "headerTimeout": 1900000,
+        "chunkTimeout": 60000
+      },
+      "models": {
+        "chatgpt-auto": {
+          "name": "ChatGPT Web Auto",
+          "tool_call": true,
+          "reasoning": false,
+          "temperature": false,
+          "attachment": false,
+          "modalities": {
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}

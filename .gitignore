@@ -1,8 +1,21 @@
 chatgpt-mcp
 *.exe
+*.exe~
 *.test
 /dist/
 .DS_Store
+.env
+.env.*
+!.env.example
+
+# guard against accidentally placing the authenticated profile in the repo
+.chatgpt-mcp/
+Profile/
+coverage.out
 
 # error screenshots can contain account data
 debug/
+chatgpt-mcp-*.png
+not-ready-*.png
+send-failed-*.png
+snapshot-failed-*.png
