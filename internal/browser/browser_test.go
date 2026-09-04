@@ -177,24 +177,41 @@ func TestConnectWebSocketHandshakeHonorsCancellation(t *testing.T) {
 				}
 			}()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			started := time.Now()
-			_, browserCancel, transport, err := connect(ctx, scheme+"://"+listener.Addr().String()+"/devtools/browser/stalled")
-			if browserCancel != nil || transport != nil {
-				t.Fatal("stalled connection returned live browser handles")
+			type connectResult struct {
+				browserCancel bool
+				transport     bool
+				err           error
 			}
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("connect() error = %v, want context deadline exceeded", err)
-			}
-			if elapsed := time.Since(started); elapsed > time.Second {
-				t.Fatalf("stalled WebSocket handshake returned after %s", elapsed)
-			}
+			ctx, cancel := context.WithCancel(context.Background())
+			results := make(chan connectResult, 1)
+			go func() {
+				_, browserCancel, transport, connectErr := connect(ctx, scheme+"://"+listener.Addr().String()+"/devtools/browser/stalled")
+				results <- connectResult{browserCancel: browserCancel != nil, transport: transport != nil, err: connectErr}
+			}()
+
+			var connection net.Conn
 			select {
-			case connection := <-accepted:
-				_ = connection.Close()
-			case <-time.After(time.Second):
+			case connection = <-accepted:
+			case <-time.After(2 * time.Second):
+				cancel()
 				t.Fatal("test server did not accept the WebSocket connection")
+			}
+			defer connection.Close()
+			started := time.Now()
+			cancel()
+			select {
+			case result := <-results:
+				if result.browserCancel || result.transport {
+					t.Fatal("stalled connection returned live browser handles")
+				}
+				if !errors.Is(result.err, context.Canceled) {
+					t.Fatalf("connect() error = %v, want context canceled", result.err)
+				}
+				if elapsed := time.Since(started); elapsed > time.Second {
+					t.Fatalf("stalled WebSocket handshake returned after %s", elapsed)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("stalled WebSocket handshake ignored cancellation")
 			}
 		})
 	}

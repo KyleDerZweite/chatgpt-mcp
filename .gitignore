@@ -1,5 +1,6 @@
 chatgpt-mcp
 *.exe
+*.exe~
 *.test
 /dist/
 .DS_Store

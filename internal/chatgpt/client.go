@@ -664,7 +664,9 @@ func (c *Client) Upload(ctx context.Context, paths []string, prompt string, time
 	if err := transaction.verify(c, operationCtx, false); err != nil {
 		return nil, err
 	}
-	fileInput = composer.FileInput
+	// Keep the mutation tied to the full upload operation even if composer
+	// discovery used a shorter-lived search context.
+	fileInput = composer.FileInput.Context(operationCtx)
 	if err := c.session.AssertChatGPTOrigin(operationCtx); err != nil {
 		return nil, err
 	}
@@ -673,7 +675,8 @@ func (c *Client) Upload(ctx context.Context, paths []string, prompt string, time
 		c.quarantineAfterMutation(err)
 		return nil, err
 	}
-	if err := c.waitForUploadsReady(operationCtx, composer, displayNames); err != nil {
+	composer, err = c.waitForUploadsReady(operationCtx, displayNames)
+	if err != nil {
 		c.quarantineAfterMutation(err)
 		return nil, err
 	}
@@ -1027,7 +1030,10 @@ func (c *Client) sendPromptToUI(ctx context.Context, transaction *conversationTr
 			if err := transaction.beginSubmission(); err != nil {
 				return err
 			}
-			return c.clickCurrentComposerSend(buttonCtx, text, expectedAttachments)
+			if err := c.clickCurrentComposerSend(buttonCtx, text, expectedAttachments); err != nil {
+				return err
+			}
+			return transaction.waitForSubmissionStart(c, ctx)
 		}
 		if err := sleepContext(buttonCtx, 100*time.Millisecond); err != nil {
 			return fmt.Errorf("composer send control did not become ready: %w", err)
@@ -1263,19 +1269,33 @@ func normalizeComposerText(value string) string {
 	return strings.TrimSpace(value)
 }
 
-func (c *Client) waitForUploadsReady(ctx context.Context, composer *composerElements, expectedNames []string) error {
+func (c *Client) waitForUploadsReady(ctx context.Context, expectedNames []string) (*composerElements, error) {
 	readyConsecutive := 0
 	var lastErr error
 	for {
 		if err := c.session.AssertChatGPTOrigin(ctx); err != nil {
-			return err
+			return nil, err
+		}
+		// File selection can cause React to replace the entire composer. Resolve
+		// the live root on every observation instead of reading a detached handle.
+		composer, err := resolveComposerOnce(c.session.Page, ctx, false)
+		if errors.Is(err, errComposerUnavailable) {
+			readyConsecutive = 0
+			lastErr = err
+			if sleepErr := sleepContext(ctx, 250*time.Millisecond); sleepErr != nil {
+				return nil, fmt.Errorf("file upload did not become ready (%v): %w", lastErr, sleepErr)
+			}
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve live upload composer: %w", err)
 		}
 		state, err := c.readComposerAttachmentState(ctx, composer)
 		if err != nil {
-			return fmt.Errorf("inspect upload state: %w", err)
+			return nil, fmt.Errorf("inspect upload state: %w", err)
 		}
 		if state.Error != "" {
-			return fmt.Errorf("ChatGPT reported an upload error: %s", state.Error)
+			return nil, fmt.Errorf("ChatGPT reported an upload error: %s", state.Error)
 		}
 		matchErr := matchExpectedAttachments(state, expectedNames)
 		button, buttonErr := findComposerSendOnce(ctx, composer)
@@ -1284,12 +1304,12 @@ func (c *Client) waitForUploadsReady(ctx context.Context, composer *composerElem
 			ready, buttonErr = composerSendReady(button)
 		}
 		if buttonErr != nil && !errors.Is(buttonErr, errComposerUnavailable) {
-			return fmt.Errorf("inspect upload send control: %w", buttonErr)
+			return nil, fmt.Errorf("inspect upload send control: %w", buttonErr)
 		}
 		if matchErr == nil && ready {
 			readyConsecutive++
 			if readyConsecutive >= 2 {
-				return nil
+				return composer.withContext(ctx), nil
 			}
 		} else {
 			readyConsecutive = 0
@@ -1300,7 +1320,7 @@ func (c *Client) waitForUploadsReady(ctx context.Context, composer *composerElem
 			}
 		}
 		if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
-			return fmt.Errorf("file upload did not become ready (%v): %w", lastErr, err)
+			return nil, fmt.Errorf("file upload did not become ready (%v): %w", lastErr, err)
 		}
 	}
 }
@@ -1339,14 +1359,15 @@ func (c *Client) ensureConversationBinding(ctx context.Context, requireExisting 
 }
 
 type conversationTransaction struct {
-	id                string
-	prompt            string
-	attachments       []string
-	beforeUserCount   int
-	requiresNew       bool
-	targetID          proto.TargetTargetID
-	observer          *submissionObserver
-	observedMessageID string
+	id                  string
+	prompt              string
+	attachments         []string
+	beforeUserCount     int
+	beforeUserMessageID string
+	requiresNew         bool
+	targetID            proto.TargetTargetID
+	observer            *submissionObserver
+	observedMessageID   string
 }
 
 func (transaction *conversationTransaction) verify(c *Client, ctx context.Context, allowNewConversation bool) error {

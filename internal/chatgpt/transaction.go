@@ -18,6 +18,8 @@ import (
 
 var errConversationTransitionPending = errors.New("new conversation route appeared before the submitted user turn")
 
+const submissionStartTimeout = 5 * time.Second
+
 type submittedTurnState struct {
 	UserCount int        `json:"userCount"`
 	MessageID string     `json:"messageId"`
@@ -91,7 +93,9 @@ const submittedTurnStateJS = `function() {
     '[data-testid*="file" i][data-testid*="pill" i]',
     '[data-testid*="file" i][data-testid*="preview" i]',
     '[data-testid*="file" i][data-testid*="item" i]',
-    '[data-testid*="file" i][data-testid*="thumbnail" i]'
+    '[data-testid*="file" i][data-testid*="thumbnail" i]',
+    '[role="group"][aria-label][class*="file-tile"]',
+    '[role="group"][aria-label]:has([data-testid="library-file-icon"])'
   ].join(',');
   let items = Array.from(user.querySelectorAll(itemSelector)).filter(visible);
   items = items.filter((el, index) => items.indexOf(el) === index &&
@@ -142,16 +146,94 @@ func (c *Client) newConversationTransaction(ctx context.Context, prompt string, 
 		attachments: append([]string(nil), attachments...),
 		targetID:    c.session.Page.TargetID,
 	}
-	if transaction.id != "" {
-		return transaction, nil
-	}
-	transaction.requiresNew = true
 	state, err := c.submittedTurnState(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("capture pre-send user-turn state: %w", err)
 	}
 	transaction.beforeUserCount = state.UserCount
+	transaction.beforeUserMessageID = state.MessageID
+	if transaction.id != "" {
+		return transaction, nil
+	}
+	transaction.requiresNew = true
 	return transaction, nil
+}
+
+// waitForSubmissionStart bounds the gap between activating the composer and
+// polling for a response. Composer clearing and stop-button transitions are
+// intentionally not evidence: both can be transient even when ChatGPT ignores
+// an activation. A causal conversation request or a newly rendered matching
+// user turn is strong enough to proceed. The caller must not activate again on
+// timeout because delivery may still be ambiguous.
+func (transaction *conversationTransaction) waitForSubmissionStart(c *Client, ctx context.Context) error {
+	waitCtx, cancel := context.WithTimeout(ctx, submissionStartTimeout)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+
+	for {
+		if err := transaction.verify(c, waitCtx, true); err != nil {
+			if !errors.Is(err, errConversationTransitionPending) {
+				if waitCtx.Err() == nil {
+					return fmt.Errorf("verify browser state while awaiting prompt activation: %w", err)
+				}
+				lastErr = err
+			}
+		} else if transaction.requiresNew && transaction.id != "" {
+			// A new-chat route is only adopted after verifyTransitionEvidence
+			// correlates it with the exact observed request and rendered turn.
+			return nil
+		}
+
+		messageID, err := transaction.observedSubmissionID(waitCtx)
+		if err == nil && messageID != "" && transaction.attachments == nil {
+			return nil
+		}
+		if err != nil && !errors.Is(err, errConversationTransitionPending) {
+			lastErr = err
+		}
+
+		state, err := c.submittedTurnState(waitCtx)
+		if err == nil {
+			if transaction.renderedSubmissionStarted(state) {
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if lastErr != nil {
+				return fmt.Errorf("prompt activation was not acknowledged within %s (last observation error: %v)", submissionStartTimeout, lastErr)
+			}
+			return fmt.Errorf("prompt activation was not acknowledged within %s", submissionStartTimeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (transaction *conversationTransaction) renderedSubmissionStarted(state submittedTurnState) bool {
+	// Rendered text/count changes are not causal evidence because virtualized
+	// history can hydrate while a request is in flight. Require the exact user
+	// message id observed in the outgoing conversation request.
+	if transaction.observedMessageID == "" ||
+		!submittedMessageIDPattern.MatchString(state.MessageID) ||
+		state.MessageID != transaction.observedMessageID ||
+		state.MessageID == transaction.beforeUserMessageID ||
+		(transaction.requiresNew && state.UserCount <= transaction.beforeUserCount) ||
+		normalizeSubmittedText(state.Text) != transaction.prompt {
+		return false
+	}
+	attachments := composerAttachmentState{Items: state.Items}
+	if transaction.attachments == nil {
+		return len(state.Items) == 0
+	}
+	return matchExpectedAttachments(attachments, transaction.attachments) == nil
 }
 
 func (transaction *conversationTransaction) verifyTransitionEvidence(c *Client, ctx context.Context) error {
@@ -186,19 +268,17 @@ func (transaction *conversationTransaction) verifyTransitionEvidence(c *Client, 
 }
 
 // armSubmissionObserver starts a CDP network listener immediately before the
-// send click. New-chat route adoption then requires the user-message id from
-// that exact submission request to appear in the rendered user turn. Matching
-// text alone is intentionally insufficient because an existing conversation
-// can contain the same prompt.
+// composer activation. A matching request acknowledges both new and existing
+// conversation submissions; new-chat route adoption additionally requires its
+// user-message id to appear in the rendered user turn. Matching text alone is
+// intentionally insufficient for route adoption because an existing
+// conversation can contain the same prompt.
 func (transaction *conversationTransaction) armSubmissionObserver(c *Client, setupCtx, lifetimeCtx context.Context) error {
-	if !transaction.requiresNew {
-		return nil
-	}
 	if transaction.observer != nil {
-		return fmt.Errorf("new-chat submission observer is already armed")
+		return fmt.Errorf("submission observer is already armed")
 	}
 	if c.session == nil || c.session.Page == nil || c.session.Page.TargetID != transaction.targetID {
-		return fmt.Errorf("browser target changed before the new-chat submission")
+		return fmt.Errorf("browser target changed before submission")
 	}
 	maxPostDataSize := 8 << 20
 	if err := (proto.NetworkEnable{MaxPostDataSize: &maxPostDataSize}).Call(c.session.Page.Context(setupCtx)); err != nil {
@@ -229,7 +309,7 @@ func (transaction *conversationTransaction) armSubmissionObserver(c *Client, set
 		wait()
 		if observerCtx.Err() != nil {
 			select {
-			case observer.result <- submissionObservation{err: fmt.Errorf("capture new-chat submission identity: %w", observerCtx.Err())}:
+			case observer.result <- submissionObservation{err: fmt.Errorf("capture submission identity: %w", observerCtx.Err())}:
 			default:
 			}
 		}
@@ -238,25 +318,19 @@ func (transaction *conversationTransaction) armSubmissionObserver(c *Client, set
 }
 
 func (transaction *conversationTransaction) beginSubmission() error {
-	if !transaction.requiresNew {
-		return nil
-	}
 	if transaction.observer == nil {
-		return fmt.Errorf("new-chat submission observer is not armed")
+		return fmt.Errorf("submission observer is not armed")
 	}
 	transaction.observer.accepting.Store(true)
 	return nil
 }
 
 func (transaction *conversationTransaction) observedSubmissionID(ctx context.Context) (string, error) {
-	if !transaction.requiresNew {
-		return "", nil
-	}
 	if transaction.observedMessageID != "" {
 		return transaction.observedMessageID, nil
 	}
 	if transaction.observer == nil {
-		return "", fmt.Errorf("new-chat route appeared without an armed submission observer")
+		return "", fmt.Errorf("submission observer is not armed")
 	}
 	select {
 	case observation := <-transaction.observer.result:
@@ -264,7 +338,7 @@ func (transaction *conversationTransaction) observedSubmissionID(ctx context.Con
 			return "", observation.err
 		}
 		if observation.messageID == "" {
-			return "", fmt.Errorf("new-chat submission did not expose a message identity")
+			return "", fmt.Errorf("submission did not expose a message identity")
 		}
 		transaction.observedMessageID = observation.messageID
 		return observation.messageID, nil
@@ -277,7 +351,7 @@ func (transaction *conversationTransaction) observedSubmissionID(ctx context.Con
 			transaction.observedMessageID = observation.messageID
 			return observation.messageID, nil
 		default:
-			return "", fmt.Errorf("new-chat submission ended without a message identity")
+			return "", fmt.Errorf("submission ended without a message identity")
 		}
 	case <-ctx.Done():
 		return "", ctx.Err()
@@ -298,7 +372,7 @@ func submittedMessageIDFromRequest(event *proto.NetworkRequestWillBeSent, expect
 	}
 	u, err := url.Parse(event.Request.URL)
 	if err != nil || browser.ValidateChatGPTURL(event.Request.URL) != nil ||
-		!strings.Contains(strings.ToLower(u.Path), "conversation") {
+		!strings.HasSuffix(strings.TrimSuffix(strings.ToLower(u.Path), "/"), "/conversation") {
 		return "", false
 	}
 	var payload map[string]any
@@ -309,19 +383,25 @@ func submittedMessageIDFromRequest(event *proto.NetworkRequestWillBeSent, expect
 	if !ok {
 		return "", false
 	}
-	match := ""
-	for _, rawMessage := range messages {
+	// Only the newest outgoing user message can acknowledge this activation.
+	// Older messages may be replayed as request history and can legitimately
+	// contain the same text, so recursively accepting any match is ambiguous.
+	for index := len(messages) - 1; index >= 0; index-- {
+		rawMessage := messages[index]
 		message, ok := rawMessage.(map[string]any)
-		if !ok || messageAuthorRole(message) != "user" || !containsExactSubmittedText(message["content"], expectedPrompt) {
+		if !ok || messageAuthorRole(message) != "user" {
 			continue
 		}
-		messageID, _ := message["id"].(string)
-		if !submittedMessageIDPattern.MatchString(messageID) || (match != "" && match != messageID) {
+		if !containsExactSubmittedText(message["content"], expectedPrompt) {
 			return "", false
 		}
-		match = messageID
+		messageID, _ := message["id"].(string)
+		if !submittedMessageIDPattern.MatchString(messageID) {
+			return "", false
+		}
+		return messageID, true
 	}
-	return match, match != ""
+	return "", false
 }
 
 func messageAuthorRole(message map[string]any) string {
@@ -331,18 +411,24 @@ func messageAuthorRole(message map[string]any) string {
 }
 
 func containsExactSubmittedText(value any, expected string) bool {
-	switch typed := value.(type) {
-	case string:
-		return normalizeSubmittedText(typed) == expected
-	case []any:
-		for _, item := range typed {
-			if containsExactSubmittedText(item, expected) {
+	content, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	parts, ok := content["parts"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawPart := range parts {
+		switch part := rawPart.(type) {
+		case string:
+			if normalizeSubmittedText(part) == expected {
 				return true
 			}
-		}
-	case map[string]any:
-		for _, item := range typed {
-			if containsExactSubmittedText(item, expected) {
+		case map[string]any:
+			// Some multimodal payloads wrap a textual part explicitly. Never
+			// recurse into metadata such as content_type or asset pointers.
+			if text, ok := part["text"].(string); ok && normalizeSubmittedText(text) == expected {
 				return true
 			}
 		}

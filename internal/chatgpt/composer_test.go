@@ -40,3 +40,20 @@ func TestExpectedAttachmentsAllowClearedNativeFileInput(t *testing.T) {
 		t.Fatalf("attachment check rejected a valid rendered chip after input reset: %v", err)
 	}
 }
+
+func TestExpectedAttachmentsAllowChatGPTCollisionSuffix(t *testing.T) {
+	state := composerAttachmentState{
+		Items:      [][]string{{"answer(2).pdf", "Document"}},
+		InputNames: []string{"answer.pdf"},
+	}
+	if err := matchExpectedAttachments(state, []string{"answer.pdf"}); err != nil {
+		t.Fatalf("attachment check rejected ChatGPT's collision suffix: %v", err)
+	}
+	state.Items = [][]string{{"other(2).pdf", "Document"}}
+	if err := matchExpectedAttachments(state, []string{"answer.pdf"}); err == nil {
+		t.Fatal("attachment check accepted an unrelated collision-suffixed file")
+	}
+	if !chatGPTDisplayFilenameMatches("kk(2).txt", "KK.txt") {
+		t.Fatal("Unicode case-folded collision suffix was not matched safely")
+	}
+}

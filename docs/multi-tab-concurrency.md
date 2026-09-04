@@ -10,8 +10,9 @@ currently implemented.
 Today the bridge is deliberately single-threaded:
 
 - `browser.Session` owns one mutable `Page`.
-- `chatgpt.Client` stores one global model, chat ID, and operation gate.
-- MCP and provider calls are serialized through that gate.
+- `chatgpt.Client` stores one global model and chat ID.
+- The process-level `operationGate` shared by the MCP and provider wrappers
+  serializes browser calls.
 - Canceling tab creation can abort the whole CDP transport.
 - `Session.Invalidate` discards the entire browser connection.
 - Provider admission accepts up to eight calls, but they wait behind the one

@@ -314,6 +314,11 @@ const snapshotJS = `function() {` + snapshotVisibilityJS + `
 		if (node.tagName && node.tagName.toLowerCase() === 'br') return '\n';
 		return Array.from(node.childNodes).map(filteredText).join('');
 	}
+	function markdownDestination(value) {
+		return String(value || '').replace(/[\u0000-\u0020\u007f()<>\\]/g, function(character) {
+			return '%' + character.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase();
+		});
+	}
   function table(node) {
 		const rows = Array.from(node.querySelectorAll('tr')).filter(row => visible(row) && !hiddenOrAction(row)).map(row =>
 			Array.from(row.querySelectorAll(':scope > th, :scope > td')).filter(cell => visible(cell) && !hiddenOrAction(cell)).map(cell =>
@@ -398,12 +403,13 @@ const snapshotJS = `function() {` + snapshotVisibilityJS + `
     if (tag === 'a') {
       const label = children(node).trim() || node.getAttribute('href') || '';
       const href = node.getAttribute('href') || '';
-      return href ? '[' + label + '](' + href.replace(/\)/g, '%29') + ')' : label;
+			return href ? '[' + label + '](' + markdownDestination(href) + ')' : label;
     }
     if (tag === 'img') {
       const src = node.getAttribute('src') || '';
       const alt = node.getAttribute('alt') || '';
-      return src ? '![' + alt.replace(/\]/g, '\\]') + '](' + src.replace(/\)/g, '%29') + ')' : '';
+			const safeAlt = alt.replace(/\\/g, '\\\\').replace(/([\[\]])/g, '\\$1');
+			return src ? '![' + safeAlt + '](' + markdownDestination(src) + ')' : '';
     }
     if (tag === 'blockquote') {
       return children(node).trim().split(/\r?\n/).map(line => '> ' + line).join('\n') + '\n\n';
@@ -450,6 +456,10 @@ const snapshotJS = `function() {` + snapshotVisibilityJS + `
 		return blocks.map(read).map(text => text.trim()).filter(Boolean).join('\n\n');
 	}
 	function hasSemanticMarkdown(blocks) {
+		const paragraphs = blocks.flatMap(block => [block].concat(Array.from(block.querySelectorAll('p')))).filter(node =>
+			node.tagName && node.tagName.toLowerCase() === 'p' && !hiddenOrAction(node)
+		);
+		if (paragraphs.length > 1) return true;
 		const semanticTags = new Set([
 			'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b', 'em', 'i', 'del', 's',
 			'code', 'pre', 'a', 'img', 'blockquote', 'ul', 'ol', 'table', 'hr'

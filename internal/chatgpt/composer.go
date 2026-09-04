@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -82,6 +83,23 @@ type composerElements struct {
 	Root      *rod.Element
 	Prompt    *rod.Element
 	FileInput *rod.Element
+}
+
+func (c *composerElements) withContext(ctx context.Context) *composerElements {
+	if c == nil {
+		return nil
+	}
+	rebound := *c
+	if rebound.Root != nil {
+		rebound.Root = rebound.Root.Context(ctx)
+	}
+	if rebound.Prompt != nil {
+		rebound.Prompt = rebound.Prompt.Context(ctx)
+	}
+	if rebound.FileInput != nil {
+		rebound.FileInput = rebound.FileInput.Context(ctx)
+	}
+	return &rebound
 }
 
 var errComposerUnavailable = errors.New("verified ChatGPT composer is not available")
@@ -177,7 +195,10 @@ func (c *Client) findComposer(ctx context.Context, max time.Duration, requireFil
 			if err := c.session.AssertChatGPTOrigin(searchCtx); err != nil {
 				return nil, err
 			}
-			return composer, nil
+			// resolveComposerOnce binds its handles to searchCtx. Rebind them to
+			// the caller's operation context before the deferred search cancel
+			// fires, otherwise later mutations fail immediately with context.Canceled.
+			return composer.withContext(ctx), nil
 		}
 		lastErr = err
 		if !errors.Is(err, errComposerUnavailable) {
@@ -215,7 +236,9 @@ const composerAttachmentStateJS = `function() {
     '[data-testid*="file" i][data-testid*="pill" i]',
     '[data-testid*="file" i][data-testid*="preview" i]',
     '[data-testid*="file" i][data-testid*="item" i]',
-    '[data-testid*="file" i][data-testid*="thumbnail" i]'
+    '[data-testid*="file" i][data-testid*="thumbnail" i]',
+    '[role="group"][aria-label][class*="file-tile"]',
+    '[role="group"][aria-label]:has([data-testid="library-file-icon"])'
   ].join(',');
   let items = Array.from(this.querySelectorAll(itemSelector)).filter(visible);
   items = items.filter((el, index) => items.indexOf(el) === index &&
@@ -337,7 +360,7 @@ func matchExpectedAttachments(state composerAttachmentState, expected []string) 
 				continue
 			}
 			for _, value := range values {
-				if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(expectedName)) {
+				if chatGPTDisplayFilenameMatches(value, expectedName) {
 					matched[index] = true
 					found = true
 					break
@@ -352,6 +375,41 @@ func matchExpectedAttachments(state composerAttachmentState, expected []string) 
 		}
 	}
 	return nil
+}
+
+// ChatGPT can preserve the exact native file-input name while assigning a
+// collision suffix to the rendered library tile (for example, report(2).pdf).
+// Accept only that narrowly defined display-name transformation.
+func chatGPTDisplayFilenameMatches(actual, expected string) bool {
+	actual = strings.TrimSpace(actual)
+	expected = strings.TrimSpace(expected)
+	if strings.EqualFold(actual, expected) {
+		return true
+	}
+
+	actualExt := filepath.Ext(actual)
+	expectedExt := filepath.Ext(expected)
+	if !strings.EqualFold(actualExt, expectedExt) {
+		return false
+	}
+	actualStem := strings.TrimSuffix(actual, actualExt)
+	expectedStem := strings.TrimSuffix(expected, expectedExt)
+	actualRunes := []rune(actualStem)
+	expectedRunes := []rune(expectedStem)
+	if len(actualRunes) <= len(expectedRunes) ||
+		!strings.EqualFold(string(actualRunes[:len(expectedRunes)]), expectedStem) {
+		return false
+	}
+	suffix := strings.TrimSpace(string(actualRunes[len(expectedRunes):]))
+	if len(suffix) < 3 || suffix[0] != '(' || suffix[len(suffix)-1] != ')' {
+		return false
+	}
+	for _, character := range suffix[1 : len(suffix)-1] {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func sameFilenameSet(actual, expected []string) bool {

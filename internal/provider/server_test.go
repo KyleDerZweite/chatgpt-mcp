@@ -23,6 +23,22 @@ type fakeCompleter struct {
 	complete func(context.Context, string, string) (*chatgpt.AskResult, error)
 }
 
+type nonFlushingRecorder struct {
+	recorder *httptest.ResponseRecorder
+}
+
+func (r *nonFlushingRecorder) Header() http.Header {
+	return r.recorder.Header()
+}
+
+func (r *nonFlushingRecorder) Write(body []byte) (int, error) {
+	return r.recorder.Write(body)
+}
+
+func (r *nonFlushingRecorder) WriteHeader(statusCode int) {
+	r.recorder.WriteHeader(statusCode)
+}
+
 func (f *fakeCompleter) Complete(ctx context.Context, prompt, model string, _ time.Duration) (*chatgpt.AskResult, error) {
 	f.mu.Lock()
 	f.prompts = append(f.prompts, prompt)
@@ -232,6 +248,120 @@ func TestStreamingCompletionHasKeepaliveFinishUsageAndDone(t *testing.T) {
 	if strings.Contains(stream, `"prompt_tokens":0`) || strings.Contains(stream, `"completion_tokens":0`) {
 		t.Fatalf("stream contains a zero usage estimate:\n%s", stream)
 	}
+
+	data := sseData(t, stream)
+	if len(data) != 5 {
+		t.Fatalf("SSE data event count = %d, want 5:\n%s", len(data), stream)
+	}
+	if data[4] != "[DONE]" {
+		t.Fatalf("last SSE data event = %q, want [DONE]", data[4])
+	}
+	var chunks []map[string]any
+	for i, payload := range data[:4] {
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("decode SSE data event %d: %v\npayload: %s", i, err, payload)
+		}
+		chunks = append(chunks, chunk)
+	}
+	firstChoice := streamChoice(t, chunks[0])
+	firstDelta := streamDelta(t, firstChoice)
+	if firstDelta["role"] != "assistant" || firstDelta["content"] != "" || firstChoice["finish_reason"] != nil {
+		t.Fatalf("unexpected role chunk: %#v", firstChoice)
+	}
+	contentChoice := streamChoice(t, chunks[1])
+	if content := streamDelta(t, contentChoice)["content"]; content != "streamed" || contentChoice["finish_reason"] != nil {
+		t.Fatalf("unexpected content chunk: %#v", contentChoice)
+	}
+	finishChoice := streamChoice(t, chunks[2])
+	if len(streamDelta(t, finishChoice)) != 0 || finishChoice["finish_reason"] != "stop" {
+		t.Fatalf("unexpected finish chunk: %#v", finishChoice)
+	}
+	usageChoices, ok := chunks[3]["choices"].([]any)
+	if !ok || len(usageChoices) != 0 || chunks[3]["usage"] == nil {
+		t.Fatalf("unexpected usage chunk: %#v", chunks[3])
+	}
+}
+
+func TestStreamingValidationErrorStaysJSON(t *testing.T) {
+	called := false
+	backend := &fakeCompleter{complete: func(context.Context, string, string) (*chatgpt.AskResult, error) {
+		called = true
+		return &chatgpt.AskResult{Response: "unused"}, nil
+	}}
+	server := testServer(t, backend, nil)
+	body := `{"model":"gpt-5","messages":[],"stream":true}`
+	response := request(t, server, http.MethodPost, "/v1/chat/completions", body, "")
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", contentType)
+	}
+	if called {
+		t.Fatal("backend was called for a request rejected before streaming began")
+	}
+	if strings.Contains(response.Body.String(), "data:") {
+		t.Fatalf("validation error was framed as SSE: %s", response.Body.String())
+	}
+}
+
+func TestStreamingRequiresFlusherBeforeStartingSSE(t *testing.T) {
+	called := false
+	backend := &fakeCompleter{complete: func(context.Context, string, string) (*chatgpt.AskResult, error) {
+		called = true
+		return &chatgpt.AskResult{Response: "unused"}, nil
+	}}
+	server := testServer(t, backend, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	req.Host = "127.0.0.1:8787"
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(&nonFlushingRecorder{recorder: recorder}, req)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body: %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if contentType := recorder.Header().Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", contentType)
+	}
+	if called {
+		t.Fatal("backend was called without a streaming-capable response writer")
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"streaming_unavailable"`) {
+		t.Fatalf("missing streaming_unavailable error: %s", recorder.Body.String())
+	}
+}
+
+func sseData(t *testing.T, stream string) []string {
+	t.Helper()
+	var data []string
+	for _, line := range strings.Split(stream, "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			data = append(data, strings.TrimPrefix(line, "data: "))
+		}
+	}
+	return data
+}
+
+func streamChoice(t *testing.T, chunk map[string]any) map[string]any {
+	t.Helper()
+	choices, ok := chunk["choices"].([]any)
+	if !ok || len(choices) != 1 {
+		t.Fatalf("unexpected choices in stream chunk: %#v", chunk)
+	}
+	choice, ok := choices[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected stream choice: %#v", choices[0])
+	}
+	return choice
+}
+
+func streamDelta(t *testing.T, choice map[string]any) map[string]any {
+	t.Helper()
+	delta, ok := choice["delta"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected stream delta: %#v", choice["delta"])
+	}
+	return delta
 }
 
 func TestStreamingTimeoutEmitsErrorAndDone(t *testing.T) {

@@ -332,10 +332,13 @@ return</code></pre>
 	})
 
 	t.Run("file input is scoped to the unique composer", func(t *testing.T) {
-		composer, err := resolveComposerOnce(page, ctx, true)
+		searchCtx, cancelSearch := context.WithCancel(ctx)
+		composer, err := resolveComposerOnce(page, searchCtx, true)
 		if err != nil {
 			t.Fatalf("resolve fixture composer: %v", err)
 		}
+		composer = composer.withContext(ctx)
+		cancelSearch()
 		input := composer.FileInput
 		if input == nil || input.GetContext().Err() != nil {
 			t.Fatalf("hidden file input has an unusable context: element=%v error=%v", input, input.GetContext().Err())
@@ -381,6 +384,19 @@ return</code></pre>
 		}
 		if err := matchExpectedAttachments(state, []string{"answer.pdf"}); err != nil {
 			t.Fatalf("exact attachment was not accepted: %v (state=%+v)", err, state)
+		}
+		if _, err := page.Context(ctx).Eval(`function() {
+		  const chip = document.querySelector('[data-testid="attachment-chip"]');
+		  chip.outerHTML = '<div role="group" aria-label="answer(2).pdf" class="group/file-tile"><svg data-testid="library-file-icon"></svg><div>answer(2).pdf</div><div>Document</div></div>';
+		}`); err != nil {
+			t.Fatalf("install current ChatGPT file-tile fixture: %v", err)
+		}
+		state, err = readComposerAttachmentStateUnchecked(ctx, composer, composerAttachmentStateJS)
+		if err != nil {
+			t.Fatalf("read current file-tile attachment state: %v", err)
+		}
+		if err := matchExpectedAttachments(state, []string{"answer.pdf"}); err != nil {
+			t.Fatalf("current ChatGPT file tile was not accepted: %v (state=%+v)", err, state)
 		}
 	})
 
@@ -474,6 +490,59 @@ return</code></pre>
 		}
 		if got, want := answer.ResponseText, "Literal *asterisks* remain text."; got != want {
 			t.Fatalf("raw response = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("plain paragraphs retain their Markdown separation", func(t *testing.T) {
+		fixture := `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1">
+  <div data-message-author-role="assistant" data-message-id="assistant-paragraphs" data-is-streaming="false">
+    <div data-message-content><p>First paragraph.</p><p>Second paragraph.</p></div>
+  </div>
+</div>
+<form><input id="prompt-textarea"><button data-testid="send-button">Send</button></form>
+</main></body></html>`
+		if err := page.Context(ctx).SetDocumentContent(fixture); err != nil {
+			t.Fatalf("set paragraph fixture DOM: %v", err)
+		}
+		answer, err := client.evaluateSnapshotScript(ctx, snapshotJS)
+		if err != nil {
+			t.Fatalf("extract paragraph response: %v", err)
+		}
+		if !answer.HasSemanticMarkdown {
+			t.Fatal("multiple paragraphs were not identified as semantic Markdown")
+		}
+		if got, want := answer.response(), "First paragraph.\n\nSecond paragraph."; got != want {
+			t.Fatalf("paragraph response = %q, want %q", got, want)
+		}
+		if got, want := answer.ResponseText, "First paragraph.\nSecond paragraph."; got != want {
+			t.Fatalf("raw paragraph response = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("link and image destinations escape Markdown delimiters", func(t *testing.T) {
+		fixture := `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1">
+  <div data-message-author-role="assistant" data-message-id="assistant-destinations" data-is-streaming="false">
+    <div data-message-content><p><a href="https://example.test/Foo_(bar)">Link</a></p><img src="https://example.test/Image_(one).png" alt="x\] [Image]" width="32" height="32"></div>
+  </div>
+</div>
+<form><input id="prompt-textarea"><button data-testid="send-button">Send</button></form>
+</main></body></html>`
+		if err := page.Context(ctx).SetDocumentContent(fixture); err != nil {
+			t.Fatalf("set destination fixture DOM: %v", err)
+		}
+		answer, err := client.evaluateSnapshotScript(ctx, snapshotJS)
+		if err != nil {
+			t.Fatalf("extract destination response: %v", err)
+		}
+		for _, want := range []string{
+			`[Link](https://example.test/Foo_%28bar%29)`,
+			`![x\\\] \[Image\]](https://example.test/Image_%28one%29.png)`,
+		} {
+			if !strings.Contains(answer.response(), want) {
+				t.Fatalf("destination response %q does not contain %q", answer.response(), want)
+			}
 		}
 	})
 }

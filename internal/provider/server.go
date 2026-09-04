@@ -335,6 +335,15 @@ func (s *Server) streamCompletion(w http.ResponseWriter, clientCtx, ctx context.
 				flusher.Flush()
 				return
 			}
+			if clientCtx.Err() != nil {
+				return
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeSSE(w, apiError{Error: apiErrorDetail{Message: "provider request timed out", Type: "api_error", Code: stringPtr("timeout")}})
+				writeSSEDone(w)
+				flusher.Flush()
+				return
+			}
 			if len(calls) > 0 {
 				toolDeltas := make([]map[string]any, 0, len(calls))
 				for i, call := range calls {
