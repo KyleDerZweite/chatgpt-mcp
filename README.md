@@ -50,16 +50,44 @@ Read this before using.
 
 ## Build
 
+Use Go 1.26.10 or a newer supported Go release, Chrome or Chromium, and a
+local MCP client. The Go requirement is recorded in `go.mod`.
+
+From the repository root:
+
 ```sh
-go build -o chatgpt-mcp .
+go mod download
+go build -mod=readonly -o chatgpt-mcp .
 ```
+
+On Windows, use `go build -mod=readonly -o chatgpt-mcp.exe .`. Configure your
+MCP client with the absolute path to the resulting executable.
+
+## Development verification
+
+```sh
+go mod verify
+go mod tidy -diff
+go vet -mod=readonly ./...
+go test -mod=readonly -race ./...
+go build -mod=readonly ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+```
+
+These checks do not launch Chrome or access a ChatGPT account. There are no
+automated project tests on `main` yet, so `go test` currently checks compilation
+only. Browser behavior requires separate verification against the current page.
+
+Dependabot checks the Go module weekly. This configuration schedules dependency
+update PRs; vulnerability alerts and security-update PRs are separate GitHub
+repository settings.
 
 ## First run
 
-Launch the server from your MCP client. A Chrome window opens with the
-dedicated profile; log into ChatGPT in it. The session stays in the profile
-for later runs. If the page shows a login prompt, complete the login in the
-window and the in-flight request continues.
+Launch the server from your MCP client. The first browser tool call opens
+Chrome with the dedicated profile; log into ChatGPT in that window. The
+session stays in the profile for later runs. If the call reports that login
+is required or the interface is not ready, complete the login and retry.
 
 ## Configuration
 
